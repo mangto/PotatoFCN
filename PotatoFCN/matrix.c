@@ -50,11 +50,11 @@ Matrix copy_matrix(const Matrix* src) {
 void free_matrix(Matrix* mat) {
     if (mat && mat->values) {
         free(mat->values);
-        mat->values = NULL;
+        mat.values = NULL;
     }
     if (mat && mat->shape) {
-        free(mat->shape);
-        mat->shape = NULL;
+        free(mat.shape);
+        mat.shape = NULL;
     }
 }
 

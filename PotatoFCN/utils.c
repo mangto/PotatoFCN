@@ -18,3 +18,4 @@ void print_array_float(float* arr, int size) {
     }
     printf("]\n");
 }
+

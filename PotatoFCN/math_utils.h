@@ -1,10 +1,10 @@
 #ifndef __MATH_UTILS_H__
 #define __MATH_UTILS_H__
 
-#include "matrix.h"
+#include "tensor.h"
 
-void relu(Matrix* mat);
-void relu_derivative(Matrix* m);
-void softmax(Matrix* mat);
+void relu(Tensor* t);
+void relu_derivative(Tensor* t);
+void softmax(Tensor* t);
 
 #endif // !__MATH_UTILS_H__

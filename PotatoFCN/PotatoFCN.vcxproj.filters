@@ -24,13 +24,13 @@
     <ClCompile Include="math_utils.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="fnn.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="cnn.c">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="matrix.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tesnor.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -41,14 +41,28 @@
     <ClInclude Include="math_utils.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="fnn.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="cnn.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="matrix.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="tensor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="mnist_data\test_images.bin">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="mnist_data\test_labels.bin">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="mnist_data\train_images.bin">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="mnist_data\train_labels.bin">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

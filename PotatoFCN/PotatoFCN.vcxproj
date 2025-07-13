@@ -124,22 +124,36 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="cnn.c" />
-    <ClCompile Include="fnn.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="math_utils.c" />
     <ClCompile Include="matrix.c">
       <DeploymentContent>false</DeploymentContent>
     </ClCompile>
+    <ClCompile Include="tesnor.c" />
     <ClCompile Include="utils.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="cnn.h" />
-    <ClInclude Include="fnn.h" />
     <ClInclude Include="math_utils.h" />
     <ClInclude Include="matrix.h">
       <DeploymentContent>false</DeploymentContent>
     </ClInclude>
+    <ClInclude Include="tensor.h" />
     <ClInclude Include="utils.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="mnist_data\test_images.bin">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+    <None Include="mnist_data\test_labels.bin">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+    <None Include="mnist_data\train_images.bin">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+    <None Include="mnist_data\train_labels.bin">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
