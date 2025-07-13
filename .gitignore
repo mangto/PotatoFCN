@@ -10,6 +10,11 @@
 *.userosscache
 *.sln.docstates
 
+mnist_data/train_images.bin
+mnist_data/test_labels.bin
+mnist_data/train_images.bin
+mnist_data/train_labels.bin
+
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 
@@ -361,3 +366,7 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+/PotatoFCN/mnist_data/test_images.bin
+/PotatoFCN/mnist_data/test_labels.bin
+/PotatoFCN/mnist_data/train_images.bin
+/PotatoFCN/mnist_data/train_labels.bin
