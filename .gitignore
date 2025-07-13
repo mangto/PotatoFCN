@@ -370,3 +370,5 @@ FodyWeavers.xsd
 /PotatoFCN/mnist_data/test_labels.bin
 /PotatoFCN/mnist_data/train_images.bin
 /PotatoFCN/mnist_data/train_labels.bin
+/PotatoFCN/coco_data/
+/PotatoFCN/preprocessed_data

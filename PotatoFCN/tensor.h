@@ -29,13 +29,23 @@ Tensor* tensor_add_broadcast(const Tensor* mat_main, const Tensor* mat_broadcast
 Tensor* tensor_sum_along_axis(const Tensor* t, int axis);
 
 
-Tensor* tensor_conv2d(const Tensor* input, const Tensor* weights, const Tensor* biases, int stride, int padding);
+Tensor* tensor_conv2d(const Tensor* input, const Tensor* weights, const Tensor* biases,
+    int stride, int padding, Tensor** col_buffer_ptr);
 Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** max_indices_tensor);
 
 
 Tensor* tensor_conv_grad_bias(const Tensor* grad_output);
-Tensor* tensor_conv_grad_weights(const Tensor* input, const Tensor* grad_output, int stride, int padding);
-Tensor* tensor_conv_grad_input(const Tensor* grad_output, const Tensor* weights, int stride, int padding, const int* output_shape);
+Tensor* tensor_conv_grad_weights(const Tensor* input, const Tensor* grad_output, const Tensor* weights,
+    int stride, int padding, Tensor** col_buffer_ptr);
+
+Tensor* tensor_conv_grad_input(const Tensor* grad_output, const Tensor* weights,
+    int stride, int padding, Tensor* col_buffer);
 Tensor* tensor_maxpool_backward(const Tensor* grad_output, const Tensor* original_input, const Tensor* max_indices);
 
+Tensor* tensor_concatenate(Tensor* t1, Tensor* t2, int axis);
+void tensor_conv2d_backward(Tensor* grad_input, Tensor* grad_weights, Tensor* grad_biases, Tensor* grad_output, Tensor* input, Tensor* weights, int stride, int padding);
+void tensor_transposed_conv2d_backward(Tensor* grad_input, Tensor* grad_weights, Tensor* grad_biases, Tensor* grad_output, Tensor* input, Tensor* weights, int stride);
+void tensor_concatenate_backward(Tensor* grad_t1, Tensor* grad_t2, Tensor* grad_output, int axis, int c1_channels);
+
+Tensor* tensor_transposed_conv2d(Tensor* input, Tensor* weights, Tensor* biases, int stride);
 #endif // !__TENSOR_H__

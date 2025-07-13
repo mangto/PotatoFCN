@@ -7,15 +7,15 @@
 #include <math.h>
 #include <assert.h>
 
-// --- 정적 헬퍼 함수 선언 ---
+// --- Backward pass function prototypes ---
 static Tensor* backward_dense(Layer* l, Tensor* grad);
 static Tensor* backward_relu(Layer* l, Tensor* grad);
 static Tensor* backward_flatten(Layer* l, Tensor* grad);
-static Tensor* backward_conv2d(Layer* l, Tensor* grad);
+static Tensor* backward_conv2d(Layer* l, Tensor* grad, Tensor* col_workspace);
 static Tensor* backward_maxpool(Layer* l, Tensor* grad);
 
 
-// --- 모델 관리 ---
+// --- Model initialization and memory management ---
 void model_init(Model* model) {
     model->layers = NULL;
     model->num_layers = 0;
@@ -23,7 +23,9 @@ void model_init(Model* model) {
 
 void model_add_layer(Model* model, Layer layer) {
     model->num_layers++;
-    model->layers = (Layer*)realloc(model->layers, model->num_layers * sizeof(Layer));
+    Layer* new_layers = (Layer*)realloc(model->layers, model->num_layers * sizeof(Layer));
+    assert(new_layers != NULL && "Failed to reallocate memory for layers");
+    model->layers = new_layers;
     model->layers[model->num_layers - 1] = layer;
 }
 
@@ -31,14 +33,14 @@ void model_free(Model* model) {
     for (int i = 0; i < model->num_layers; i++) {
         Layer* l = &model->layers[i];
         if (l->type == LAYER_DENSE) {
-            free_tensor(l->params.dense.weights);
-            free_tensor(l->params.dense.biases);
+            if (l->params.dense.weights) free_tensor(l->params.dense.weights);
+            if (l->params.dense.biases) free_tensor(l->params.dense.biases);
             if (l->params.dense.grad_weights) free_tensor(l->params.dense.grad_weights);
             if (l->params.dense.grad_biases) free_tensor(l->params.dense.grad_biases);
         }
         else if (l->type == LAYER_CONV2D) {
-            free_tensor(l->params.conv2d.weights);
-            free_tensor(l->params.conv2d.biases);
+            if (l->params.conv2d.weights) free_tensor(l->params.conv2d.weights);
+            if (l->params.conv2d.biases) free_tensor(l->params.conv2d.biases);
             if (l->params.conv2d.grad_weights) free_tensor(l->params.conv2d.grad_weights);
             if (l->params.conv2d.grad_biases) free_tensor(l->params.conv2d.grad_biases);
         }
@@ -48,16 +50,18 @@ void model_free(Model* model) {
         if (l->input) free_tensor(l->input);
         if (l->output) free_tensor(l->output);
     }
-    free(model->layers);
+    if (model->layers) free(model->layers);
 }
 
 
-// --- 계층 추가 함수 구현 ---
-
+// --- Functions to add layers ---
 void model_add_dense(Model* model, int input_size, int output_size) {
     Layer l = { .type = LAYER_DENSE, .input = NULL, .output = NULL };
     l.params.dense.weights = create_tensor((int[]) { input_size, output_size }, 2);
     l.params.dense.biases = create_tensor((int[]) { 1, output_size }, 2);
+    l.params.dense.grad_weights = NULL;
+    l.params.dense.grad_biases = NULL;
+
     float scale = sqrtf(2.0f / input_size);
     for (int i = 0; i < get_tensor_size(l.params.dense.weights); i++) {
         l.params.dense.weights->values[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * scale;
@@ -80,12 +84,11 @@ void model_add_conv2d(Model* model, int in_channels, int out_channels, int kerne
     Layer l = { .type = LAYER_CONV2D, .input = NULL, .output = NULL };
     l.params.conv2d.stride = stride;
     l.params.conv2d.padding = padding;
-    // Weights: (num_filters, in_channels, kernel_size, kernel_size)
     l.params.conv2d.weights = create_tensor((int[]) { out_channels, in_channels, kernel_size, kernel_size }, 4);
-    // Biases: (num_filters)
     l.params.conv2d.biases = create_tensor((int[]) { out_channels }, 1);
+    l.params.conv2d.grad_weights = NULL;
+    l.params.conv2d.grad_biases = NULL;
 
-    // He initialization for weights
     float scale = sqrtf(2.0f / (in_channels * kernel_size * kernel_size));
     for (int i = 0; i < get_tensor_size(l.params.conv2d.weights); i++) {
         l.params.conv2d.weights->values[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * scale;
@@ -102,10 +105,10 @@ void model_add_maxpool(Model* model, int pool_size, int stride) {
 }
 
 
-// --- 순전파 및 역전파 ---
-
+// --- Forward and backward pass ---
 Tensor* model_forward(Model* model, Tensor* input, int training) {
     Tensor* current_activation = copy_tensor(input);
+    Tensor* col_workspace = NULL;
 
     for (int i = 0; i < model->num_layers; i++) {
         Layer* l = &model->layers[i];
@@ -122,17 +125,45 @@ Tensor* model_forward(Model* model, Tensor* input, int training) {
             free_tensor(y);
             break;
         }
-        case LAYER_RELU: // ... (same as before)
-        case LAYER_SOFTMAX: // ... (same as before)
-        case LAYER_FLATTEN: // ... (same as before)
+        case LAYER_RELU: {
+            next_activation = copy_tensor(current_activation);
+            relu(next_activation);
+            break;
+        }
+        case LAYER_SOFTMAX: {
+            next_activation = copy_tensor(current_activation);
+            softmax(next_activation);
+            break;
+        }
+        case LAYER_FLATTEN: {
+            if (training) {
+                l->params.flatten.input_dims = current_activation->dims;
+                for (int j = 0; j < current_activation->dims; ++j) {
+                    l->params.flatten.input_shape[j] = current_activation->shape[j];
+                }
+            }
+            next_activation = copy_tensor(current_activation);
+            tensor_reshape(next_activation, (int[]) { next_activation->shape[0], get_tensor_size(next_activation) / next_activation->shape[0] }, 2);
+            break;
+        }
         case LAYER_CONV2D: {
-            next_activation = tensor_conv2d(current_activation, l->params.conv2d.weights, l->params.conv2d.biases, l->params.conv2d.stride, l->params.conv2d.padding);
+            int C = current_activation->shape[1], H = current_activation->shape[2], W = current_activation->shape[3];
+            int K = l->params.conv2d.weights->shape[2], stride = l->params.conv2d.stride, padding = l->params.conv2d.padding;
+            int H_out = (H - K + 2 * padding) / stride + 1;
+            int W_out = (W - K + 2 * padding) / stride + 1;
+            long required_size = (long)(C * K * K) * (H_out * W_out);
+
+            if (col_workspace == NULL || get_tensor_size(col_workspace) < required_size) {
+                if (col_workspace) free_tensor(col_workspace);
+                col_workspace = create_tensor((int[]) { required_size }, 1);
+            }
+            next_activation = tensor_conv2d(current_activation, l->params.conv2d.weights, l->params.conv2d.biases, stride, padding, col_workspace);
             break;
         }
         case LAYER_MAXPOOL: {
             if (training) {
                 if (l->params.maxpool.max_indices) free_tensor(l->params.maxpool.max_indices);
-                l->params.maxpool.max_indices = NULL; //
+                l->params.maxpool.max_indices = NULL;
                 next_activation = tensor_maxpool(current_activation, l->params.maxpool.pool_size, l->params.maxpool.stride, &l->params.maxpool.max_indices);
             }
             else {
@@ -140,7 +171,7 @@ Tensor* model_forward(Model* model, Tensor* input, int training) {
             }
             break;
         }
-        } // switch end
+        }
 
         free_tensor(current_activation);
         current_activation = next_activation;
@@ -150,28 +181,35 @@ Tensor* model_forward(Model* model, Tensor* input, int training) {
             l->output = copy_tensor(current_activation);
         }
     }
+
+    if (col_workspace) free_tensor(col_workspace);
     return current_activation;
 }
 
 void model_backward(Model* model, Tensor* y_pred, Tensor* y_true) {
     Tensor* grad = tensor_sub(y_pred, y_true);
+    Tensor* col_workspace = NULL;
 
     for (int i = model->num_layers - 1; i >= 0; i--) {
         Layer* l = &model->layers[i];
         Tensor* grad_upstream = NULL;
 
         switch (l->type) {
-        case LAYER_DENSE: grad_upstream = backward_dense(l, grad); break;
-        case LAYER_RELU: grad_upstream = backward_relu(l, grad); break;
+        case LAYER_DENSE:   grad_upstream = backward_dense(l, grad); break;
+        case LAYER_RELU:    grad_upstream = backward_relu(l, grad); break;
         case LAYER_FLATTEN: grad_upstream = backward_flatten(l, grad); break;
-        case LAYER_SOFTMAX: grad_upstream = copy_tensor(grad); break;
-        case LAYER_CONV2D: grad_upstream = backward_conv2d(l, grad); break;
+        case LAYER_CONV2D:
+            grad_upstream = backward_conv2d(l, grad, col_workspace);
+            break;
         case LAYER_MAXPOOL: grad_upstream = backward_maxpool(l, grad); break;
+        case LAYER_SOFTMAX: grad_upstream = copy_tensor(grad); break;
         }
 
         free_tensor(grad);
         grad = grad_upstream;
     }
+
+    if (col_workspace) free_tensor(col_workspace);
     if (grad) free_tensor(grad);
 }
 
@@ -182,48 +220,47 @@ void model_update_params(Model* model, float learning_rate, int batch_size) {
             tensor_update(dp->weights, dp->grad_weights, learning_rate, batch_size);
             tensor_update(dp->biases, dp->grad_biases, learning_rate, batch_size);
             free_tensor(dp->grad_weights); dp->grad_weights = NULL;
-            free_tensor(dp->grad_biases); dp->grad_biases = NULL;
+            free_tensor(dp->grad_biases);  dp->grad_biases = NULL;
         }
         else if (model->layers[i].type == LAYER_CONV2D) {
             Conv2DParams* cp = &model->layers[i].params.conv2d;
             tensor_update(cp->weights, cp->grad_weights, learning_rate, batch_size);
             tensor_update(cp->biases, cp->grad_biases, learning_rate, batch_size);
             free_tensor(cp->grad_weights); cp->grad_weights = NULL;
-            free_tensor(cp->grad_biases); cp->grad_biases = NULL;
+            free_tensor(cp->grad_biases);  cp->grad_biases = NULL;
         }
     }
 }
 
-// Conv2D 역전파 (가장 복잡한 부분)
-static Tensor* backward_conv2d(Layer* l, Tensor* grad) {
+// --- Backward pass for each layer type ---
+
+static Tensor* backward_conv2d(Layer* l, Tensor* grad, Tensor* col_workspace) {
     Conv2DParams* cp = &l->params.conv2d;
     Tensor* input = l->input;
 
-    // 1. 편향 그래디언트 계산 (dL/dB)
+    if (cp->grad_weights) free_tensor(cp->grad_weights);
+    if (cp->grad_biases) free_tensor(cp->grad_biases);
+
     cp->grad_biases = tensor_conv_grad_bias(grad);
+    cp->grad_weights = tensor_conv_grad_weights(input, grad, cp->stride, cp->padding, col_workspace);
 
-    // 2. 가중치 그래디언트 계산 (dL/dW)
-    cp->grad_weights = tensor_conv_grad_weights(input, grad, cp->stride, cp->padding);
-
-    // 3. 입력 그래디언트 계산 (dL/dX)
-    Tensor* grad_upstream = tensor_conv_grad_input(input, grad, cp->weights, cp->stride, cp->padding);
+    Tensor* grad_upstream = tensor_conv_grad_input(grad, cp->weights, cp->stride, cp->padding, col_workspace);
 
     return grad_upstream;
 }
 
-
 static Tensor* backward_dense(Layer* l, Tensor* grad) {
     DenseParams* dp = &l->params.dense;
 
-    // 1. 가중치 그래디언트 계산: dL/dW = X^T * dL/dY
+    if (dp->grad_weights) free_tensor(dp->grad_weights);
+    if (dp->grad_biases) free_tensor(dp->grad_biases);
+
     Tensor* XT = tensor_transpose(l->input);
     dp->grad_weights = tensor_dot(XT, grad);
     free_tensor(XT);
 
-    // 2. 편향 그래디언트 계산: dL/db = sum(dL/dY)
     dp->grad_biases = tensor_sum_along_axis(grad, 0);
 
-    // 3. 이전 계층으로 전달할 그래디언트 계산: dL/dX = dL/dY * W^T
     Tensor* WT = tensor_transpose(dp->weights);
     Tensor* grad_upstream = tensor_dot(grad, WT);
     free_tensor(WT);
@@ -232,26 +269,21 @@ static Tensor* backward_dense(Layer* l, Tensor* grad) {
 }
 
 static Tensor* backward_relu(Layer* l, Tensor* grad) {
-    // dL/dX = dL/dY * (dY/dX)
-    // ReLU의 미분 (dY/dX)은 X > 0 이면 1, 아니면 0
     Tensor* deriv = copy_tensor(l->input);
-    relu_derivative(deriv); // math_utils.c에 구현 필요
+    relu_derivative(deriv);
     Tensor* grad_upstream = tensor_elemwise_mul(grad, deriv);
     free_tensor(deriv);
     return grad_upstream;
 }
 
 static Tensor* backward_flatten(Layer* l, Tensor* grad) {
-    // 그래디언트의 형태를 flatten 이전의 형태로 복원
     Tensor* grad_upstream = copy_tensor(grad);
     tensor_reshape(grad_upstream, l->params.flatten.input_shape, l->params.flatten.input_dims);
     return grad_upstream;
 }
 
-
-// MaxPool 역전파
 static Tensor* backward_maxpool(Layer* l, Tensor* grad) {
-    Tensor* grad_upstream = tensor_maxpool_backward(grad, l->input, l->params.maxpool.max_indices, l->params.maxpool.pool_size, l->params.maxpool.stride);
+    Tensor* grad_upstream = tensor_maxpool_backward(grad, l->input, l->params.maxpool.max_indices);
     return grad_upstream;
 }
 ```
@@ -261,7 +293,7 @@ static Tensor* backward_maxpool(Layer* l, Tensor* grad) {
 
 #include "tensor.h"
 
-// LayerType에 CONV2D와 MAXPOOL 추가
+// Enum for different layer types
 typedef enum {
     LAYER_DENSE,
     LAYER_RELU,
@@ -271,38 +303,42 @@ typedef enum {
     LAYER_MAXPOOL
 } LayerType;
 
-// --- 계층별 파라미터 구조체 ---
+// --- Structs for parameters of each layer type ---
+
+// Dense (Fully Connected) layer parameters
 typedef struct {
-    Tensor* weights;
-    Tensor* biases;
-    Tensor* grad_weights;
-    Tensor* grad_biases;
+    Tensor* weights;      // Weights
+    Tensor* biases;       // Biases
+    Tensor* grad_weights; // Gradient with respect to weights
+    Tensor* grad_biases;  // Gradient with respect to biases
 } DenseParams;
 
+// Flatten layer parameters (to restore shape during backward pass)
 typedef struct {
-    int input_shape[3];
-    int input_dims;
+    int input_shape[4]; // Shape of the input tensor (e.g., [N, C, H, W])
+    int input_dims;     // Number of dimensions of the input tensor
 } FlattenParams;
 
+// Conv2D layer parameters
 typedef struct {
-    Tensor* weights; // Shape: (num_filters, in_channels, kernel_h, kernel_w)
-    Tensor* biases;  // Shape: (num_filters)
-    Tensor* grad_weights;
-    Tensor* grad_biases;
-    int stride;
-    int padding;
+    Tensor* weights;      // Weights (filters)
+    Tensor* biases;       // Biases
+    Tensor* grad_weights; // Gradient with respect to weights
+    Tensor* grad_biases;  // Gradient with respect to biases
+    int stride;           // Stride
+    int padding;          // Padding
 } Conv2DParams;
 
+// MaxPool layer parameters
 typedef struct {
-    int pool_size;
-    int stride;
-    // 역전파 시 어느 위치의 값이 max였는지 기억하기 위한 텐서
-    Tensor* max_indices;
+    int pool_size;      // Size of the pooling window
+    int stride;         // Stride
+    Tensor* max_indices;// Indices of the max values for backward pass
 } MaxPoolParams;
 
-// --- 통합 Layer 구조체 ---
+// --- Main Layer struct ---
 typedef struct Layer {
-    LayerType type;
+    LayerType type; // Layer type
     union {
         DenseParams dense;
         FlattenParams flatten;
@@ -310,209 +346,688 @@ typedef struct Layer {
         MaxPoolParams maxpool;
     } params;
 
+    // Store input and output for the backward pass
     Tensor* input;
     Tensor* output;
 } Layer;
 
-// --- 모델 구조체 ---
+// --- Main Model struct ---
 typedef struct {
     Layer* layers;
     int num_layers;
 } Model;
 
 
-// --- 함수 프로토타입 ---
+// --- Function Prototypes ---
+
+// Model management functions
 void model_init(Model* model);
 void model_free(Model* model);
 
-// Layer 추가 함수들
+// Functions to add layers
 void model_add_dense(Model* model, int input_size, int output_size);
 void model_add_activation(Model* model, LayerType type);
 void model_add_flatten(Model* model);
 void model_add_conv2d(Model* model, int in_channels, int out_channels, int kernel_size, int stride, int padding);
 void model_add_maxpool(Model* model, int pool_size, int stride);
 
-// 학습 및 추론 함수들
+// Training and inference functions
 Tensor* model_forward(Model* model, Tensor* input, int training);
 void model_backward(Model* model, Tensor* y_pred, Tensor* y_true);
 void model_update_params(Model* model, float learning_rate, int batch_size);
 
 #endif // !__CNN_H__
+
 ```
-```main.c
-#include "cnn.h" // <-- Correct include for your setup
-#include "tensor.h"
+```cnn_unet.c
+#include "cnn_unet.h"
 #include "math_utils.h"
-#include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
-#include <math.h>
-
-// This function correctly reads the pre-processed .bin files
-void load_mnist_data(const char* image_path, const char* label_path, Tensor** images, Tensor** labels, int num_samples) {
-    FILE* f_images = fopen(image_path, "rb");
-    FILE* f_labels = fopen(label_path, "rb");
-    if (!f_images || !f_labels) {
-        fprintf(stderr, "Error: Cannot open MNIST data files at %s or %s.\n", image_path, label_path);
-        fprintf(stderr, "Please ensure the 'mnist_data' directory exists and contains the .bin files.\n");
-        exit(1);
-    }
-
-    *images = create_tensor((int[]) { num_samples, 784 }, 2);
-    *labels = create_tensor((int[]) { num_samples, 10 }, 2);
-
-    fread((*images)->values, sizeof(float), get_tensor_size(*images), f_images);
-    fread((*labels)->values, sizeof(float), get_tensor_size(*labels), f_labels);
-
-    fclose(f_images);
-    fclose(f_labels);
-}
-
-
-
-float calculate_accuracy(Model* model, Tensor* test_images, Tensor* test_labels) {
-    int correct = 0;
-    for (int i = 0; i < test_images->shape[0]; i++) {
-        Tensor* img_flat = create_tensor_from_array(&test_images->values[i * 784], (int[]) { 1, 784 }, 2);
-
-        // CNN 입력을 위해 4D 텐서로 Reshape
-        Tensor* img = copy_tensor(img_flat);
-        tensor_reshape(img, (int[]) { 1, 1, 28, 28 }, 4);
-
-        Tensor* output = model_forward(model, img, 0); // Inference mode
-
-        int predicted = 0;
-        float max_p = -1.0f;
-        for (int j = 0; j < 10; j++) {
-            if (output->values[j] > max_p) {
-                max_p = output->values[j];
-                predicted = j;
-            }
-        }
-
-        int actual = 0;
-        for (int j = 0; j < 10; j++) {
-            if (test_labels->values[i * 10 + j] == 1.0f) {
-                actual = j;
-                break;
-            }
-        }
-
-        if (predicted == actual) correct++;
-
-        free_tensor(img_flat);
-        free_tensor(img);
-        free_tensor(output);
-    }
-    return (float)correct / test_images->shape[0];
-}
-
-
-int main() {
-    srand(time(NULL));
-
-    Tensor* train_images, * train_labels, * test_images, * test_labels;
-    printf("Loading MNIST data...\n");
-    load_mnist_data("mnist_data/train_images.bin", "mnist_data/train_labels.bin", &train_images, &train_labels, 60000);
-    load_mnist_data("mnist_data/test_images.bin", "mnist_data/test_labels.bin", &test_images, &test_labels, 10000);
-    printf("Data loaded.\n\n");
-
-    // ==========================================================
-    // ## 진짜 CNN 아키텍처 정의 ##
-    // ==========================================================
-    Model model;
-    model_init(&model);
-
-    // 입력 데이터는 (Batch, 1, 28, 28) 형태가 될 것입니다.
-
-    // Block 1: Conv -> ReLU -> Pool
-    model_add_conv2d(&model, /*in_channels*/1, /*out_channels*/6, /*kernel*/5, /*stride*/1, /*padding*/0);
-    // Output shape: (Batch, 6, 24, 24)
-    model_add_activation(&model, LAYER_RELU);
-    model_add_maxpool(&model, /*pool_size*/2, /*stride*/2);
-    // Output shape: (Batch, 6, 12, 12)
-
-    // Block 2: Conv -> ReLU -> Pool
-    model_add_conv2d(&model, /*in_channels*/6, /*out_channels*/16, /*kernel*/5, /*stride*/1, /*padding*/0);
-    // Output shape: (Batch, 16, 8, 8)
-    model_add_activation(&model, LAYER_RELU);
-    model_add_maxpool(&model, /*pool_size*/2, /*stride*/2);
-    // Output shape: (Batch, 16, 4, 4)
-
-    // Flatten: 2D 피처맵을 1D 벡터로 변환
-    model_add_flatten(&model);
-    // Output shape: (Batch, 16 * 4 * 4) = (Batch, 256)
-
-    // Block 3: Dense Layers for Classification
-    model_add_dense(&model, 256, 120);
-    model_add_activation(&model, LAYER_RELU);
-    model_add_dense(&model, 120, 84);
-    model_add_activation(&model, LAYER_RELU);
-    model_add_dense(&model, 84, 10); // Final output
-    model_add_activation(&model, LAYER_SOFTMAX);
-
-    printf("True CNN Model Initialized.\n");
-
-    int epochs = 5;
-    float learning_rate = 0.01f; // CNN은 보통 더 작은 learning rate를 사용합니다.
-    int batch_size = 64;
-    int num_batches = train_images->shape[0] / batch_size;
-
-    for (int e = 0; e < epochs; e++) {
-        for (int b = 0; b < num_batches; b++) {
-            // 원본 데이터(batch, 784)를 (batch, 1, 28, 28)로 Reshape
-            Tensor* X_batch_flat = create_tensor_from_array(&train_images->values[b * batch_size * 784], (int[]) { batch_size, 784 }, 2);
-            Tensor* X_batch = copy_tensor(X_batch_flat);
-            tensor_reshape(X_batch, (int[]) { batch_size, 1, 28, 28 }, 4); // 4D 텐서로 변경
-
-            Tensor* Y_batch = create_tensor_from_array(&train_labels->values[b * batch_size * 10], (int[]) { batch_size, 10 }, 2);
-
-            Tensor* Y_pred = model_forward(&model, X_batch, 1);
-            model_backward(&model, Y_pred, Y_batch);
-            model_update_params(&model, learning_rate, batch_size);
-
-            free_tensor(X_batch_flat);
-            free_tensor(X_batch);
-            free_tensor(Y_batch);
-            free_tensor(Y_pred);
-
-            // ... (Progress bar logic is the same) ...
-        }
-        // ... (Accuracy calculation logic is the same, but remember to reshape test data too) ...
-    }
-
-    model_free(&model);
-    free_tensor(train_images);
-    free_tensor(train_labels);
-    free_tensor(test_images);
-    free_tensor(test_labels);
-
-    printf("Training finished.\n");
-    return 0;
-}
-
-```
-```math_utils.c
-#include "math_utils.h"
+#include <string.h>
 #include <math.h>
 #include <assert.h>
 
+// --- 가중치 초기화 및 계층 추가 헬퍼 함수 ---
+static void init_weights(Tensor* t) {
+    // He 초기화
+    int fan_in = (t->dims > 1) ? t->shape[1] * t->shape[2] * t->shape[3] : t->shape[0];
+    float scale = sqrtf(2.0f / fan_in);
+    for (int i = 0; i < get_tensor_size(t); i++) {
+        t->values[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * scale;
+    }
+}
+
+static void block_add_layer(Block* b, Layer l) {
+    b->num_layers++;
+    // 임시 포인터를 사용하여 realloc 실패 시 메모리 누수 방지
+    Layer* new_layers = (Layer*)realloc(b->layers, b->num_layers * sizeof(Layer));
+    assert(new_layers != NULL && "Failed to reallocate memory for layers");
+    b->layers = new_layers;
+    b->layers[b->num_layers - 1] = l;
+}
+
+static void add_conv(Block* b, int in_c, int out_c, int k, int s, int p) {
+    Layer l = { .type = LAYER_CONV2D, .stride = s, .padding = p, .input = NULL, .output = NULL };
+    l.weights = create_tensor((int[]) { out_c, in_c, k, k }, 4);
+    l.biases = create_tensor((int[]) { out_c }, 1);
+    l.grad_weights = create_tensor((int[]) { out_c, in_c, k, k }, 4);
+    l.grad_biases = create_tensor((int[]) { out_c }, 1);
+    init_weights(l.weights);
+    block_add_layer(b, l);
+}
+
+static void add_transposed_conv(Block* b, int in_c, int out_c, int k, int s) {
+    Layer l = { .type = LAYER_TRANSPOSED_CONV2D, .stride = s, .padding = 0, .input = NULL, .output = NULL };
+    l.weights = create_tensor((int[]) { in_c, out_c, k, k }, 4);
+    l.biases = create_tensor((int[]) { out_c }, 1);
+    l.grad_weights = create_tensor((int[]) { in_c, out_c, k, k }, 4);
+    l.grad_biases = create_tensor((int[]) { out_c }, 1);
+    init_weights(l.weights);
+    block_add_layer(b, l);
+}
+
+static void add_relu(Block* b) {
+    block_add_layer(b, (Layer) { .type = LAYER_RELU, .weights = NULL, .biases = NULL, .grad_weights = NULL, .grad_biases = NULL, .input = NULL, .output = NULL });
+}
+
+static void block_init(Block* b) {
+    b->layers = NULL;
+    b->num_layers = 0;
+}
+
+// --- 메모리 관리 함수 ---
+static void block_free(Block* b) {
+    for (int i = 0; i < b->num_layers; ++i) {
+        if (b->layers[i].weights) free_tensor(b->layers[i].weights);
+        if (b->layers[i].biases) free_tensor(b->layers[i].biases);
+        if (b->layers[i].grad_weights) free_tensor(b->layers[i].grad_weights);
+        if (b->layers[i].grad_biases) free_tensor(b->layers[i].grad_biases);
+        if (b->layers[i].input) free_tensor(b->layers[i].input);
+        if (b->layers[i].output) free_tensor(b->layers[i].output);
+    }
+    if (b->layers) free(b->layers);
+}
+
+void unet_free(UNetModel* model) {
+    block_free(&model->enc1);
+    block_free(&model->enc2);
+    block_free(&model->bottleneck);
+    block_free(&model->dec_up1);
+    block_free(&model->dec_conv1);
+    block_free(&model->dec_up2);
+    block_free(&model->dec_conv2);
+    block_free(&model->final_conv);
+}
+
+void unet_free_intermediates(UNetIntermediates* im) {
+    if (im) {
+        if (im->enc1_out) free_tensor(im->enc1_out);
+        if (im->enc2_out) free_tensor(im->enc2_out);
+        if (im->pool1_idx) free_tensor(im->pool1_idx);
+        if (im->pool2_idx) free_tensor(im->pool2_idx);
+        if (im->pred_mask) free_tensor(im->pred_mask);
+        free(im);
+    }
+}
+
+// --- 모델 구조 빌드 함수 ---
+void unet_build(UNetModel* model) {
+    int in_channels = 1;
+
+    // Encoder Block 1
+    block_init(&model->enc1);
+    add_conv(&model->enc1, in_channels, 16, 3, 1, 1);
+    add_relu(&model->enc1);
+    add_conv(&model->enc1, 16, 16, 3, 1, 1);
+    add_relu(&model->enc1);
+
+    // Encoder Block 2
+    block_init(&model->enc2);
+    add_conv(&model->enc2, 16, 32, 3, 1, 1);
+    add_relu(&model->enc2);
+    add_conv(&model->enc2, 32, 32, 3, 1, 1);
+    add_relu(&model->enc2);
+
+    // Bottleneck
+    block_init(&model->bottleneck);
+    add_conv(&model->bottleneck, 32, 64, 3, 1, 1);
+    add_relu(&model->bottleneck);
+
+    // Decoder Block 1 (Upsampling + Convolution)
+    block_init(&model->dec_up1);
+    add_transposed_conv(&model->dec_up1, 64, 32, 2, 2);
+    add_relu(&model->dec_up1);
+
+    block_init(&model->dec_conv1);
+    add_conv(&model->dec_conv1, 64, 32, 3, 1, 1); // Concat: 32(up) + 32(skip)
+    add_relu(&model->dec_conv1);
+    add_conv(&model->dec_conv1, 32, 32, 3, 1, 1);
+    add_relu(&model->dec_conv1);
+
+    // Decoder Block 2 (Upsampling + Convolution)
+    block_init(&model->dec_up2);
+    add_transposed_conv(&model->dec_up2, 32, 16, 2, 2);
+
+    block_init(&model->dec_conv2);
+    add_conv(&model->dec_conv2, 32, 16, 3, 1, 1); // Concat: 16(up) + 16(skip)
+    add_relu(&model->dec_conv2);
+    add_conv(&model->dec_conv2, 16, 16, 3, 1, 1);
+    add_relu(&model->dec_conv2);
+
+    // Final Layer
+    block_init(&model->final_conv);
+    add_conv(&model->final_conv, 16, 1, 1, 1, 0); // 1x1 Convolution
+}
+
+
+// --- 순전파 / 역전파 함수 ---
+static Tensor* forward_block(Block* b, Tensor* input, Tensor** col_workspace_ptr) {
+    Tensor* current = copy_tensor(input);
+    for (int i = 0; i < b->num_layers; ++i) {
+        Layer* l = &b->layers[i];
+
+        if (l->input) free_tensor(l->input);
+        l->input = copy_tensor(current);
+
+        Tensor* next = NULL;
+        switch (l->type) {
+        case LAYER_CONV2D: {
+            // 1. 현재 Conv2D 연산에 필요한 워크스페이스 크기 계산
+            int C = current->shape[1], H = current->shape[2], W = current->shape[3];
+            int K = l->weights->shape[2], stride = l->stride, padding = l->padding;
+            int H_out = (H - K + 2 * padding) / stride + 1;
+            int W_out = (W - K + 2 * padding) / stride + 1;
+            long required_size = (long)(C * K * K) * (H_out * W_out);
+
+            // 2. 현재 할당된 워크스페이스가 없거나, 크기가 부족하면 새로 할당
+            if (*col_workspace_ptr == NULL || get_tensor_size(*col_workspace_ptr) < required_size) {
+                if (*col_workspace_ptr) free_tensor(*col_workspace_ptr);
+                *col_workspace_ptr = create_tensor((int[]) { required_size }, 1);
+            }
+
+            // 3. 올바른 크기의 워크스페이스를 사용하여 conv2d 호출
+            next = tensor_conv2d(current, l->weights, l->biases, stride, padding, *col_workspace_ptr);
+            break;
+        }
+        case LAYER_TRANSPOSED_CONV2D:
+            next = tensor_transposed_conv2d(current, l->weights, l->biases, l->stride);
+            break;
+        case LAYER_RELU:
+            next = copy_tensor(current);
+            relu(next);
+            break;
+        }
+
+        if (l->output) free_tensor(l->output);
+        l->output = copy_tensor(next);
+
+        free_tensor(current);
+        current = next;
+    }
+    return current;
+}
+
+// --- [수정] unet_forward: 워크스페이스 관리 로직 단순화 ---
+UNetIntermediates* unet_forward(UNetModel* model, Tensor* input) {
+    UNetIntermediates* im = (UNetIntermediates*)calloc(1, sizeof(UNetIntermediates));
+    assert(im != NULL);
+
+    // 1. 워크스페이스 포인터를 NULL로 초기화
+    Tensor* col_workspace = NULL;
+
+    // 2. 모든 forward_block 호출 시 워크스페이스 포인터의 '주소'를 전달
+    //    이렇게 하면 forward_block 내부에서 col_workspace 자체를 변경할 수 있음
+    Tensor* enc1_out_full = forward_block(&model->enc1, input, &col_workspace);
+    im->enc1_out = copy_tensor(enc1_out_full);
+    Tensor* pool1_out = tensor_maxpool(enc1_out_full, 2, 2, &im->pool1_idx);
+    free_tensor(enc1_out_full);
+
+    Tensor* enc2_out_full = forward_block(&model->enc2, pool1_out, &col_workspace);
+    im->enc2_out = copy_tensor(enc2_out_full);
+    Tensor* pool2_out = tensor_maxpool(enc2_out_full, 2, 2, &im->pool2_idx);
+    free_tensor(pool1_out);
+    free_tensor(enc2_out_full);
+
+    Tensor* bottleneck_out = forward_block(&model->bottleneck, pool2_out, &col_workspace);
+    free_tensor(pool2_out);
+
+    Tensor* dec1_up_out = forward_block(&model->dec_up1, bottleneck_out, &col_workspace);
+    Tensor* concat1 = tensor_concatenate(dec1_up_out, im->enc2_out, 1);
+    Tensor* dec1_conv_out = forward_block(&model->dec_conv1, concat1, &col_workspace);
+    free_tensor(bottleneck_out);
+    free_tensor(dec1_up_out);
+    free_tensor(concat1);
+
+    Tensor* dec2_up_out = forward_block(&model->dec_up2, dec1_conv_out, &col_workspace);
+    Tensor* concat2 = tensor_concatenate(dec2_up_out, im->enc1_out, 1);
+    Tensor* dec2_conv_out = forward_block(&model->dec_conv2, concat2, &col_workspace);
+    free_tensor(dec1_conv_out);
+    free_tensor(dec2_up_out);
+    free_tensor(concat2);
+
+    im->pred_mask = forward_block(&model->final_conv, dec2_conv_out, &col_workspace);
+    free_tensor(dec2_conv_out);
+
+    // 3. 순전파가 모두 끝난 후 최종적으로 할당된 워크스페이스 해제
+    if (col_workspace) free_tensor(col_workspace);
+
+    return im;
+}
+
+static Tensor* backward_block(Block* b, Tensor* grad, Tensor* col_workspace) {
+    Tensor* current_grad = copy_tensor(grad);
+    for (int i = b->num_layers - 1; i >= 0; --i) {
+        Layer* l = &b->layers[i];
+        Tensor* next_grad = NULL;
+
+        switch (l->type) {
+        case LAYER_RELU: {
+            Tensor* deriv = copy_tensor(l->input);
+            relu_derivative(deriv);
+            next_grad = tensor_elemwise_mul(current_grad, deriv);
+            free_tensor(deriv);
+            break;
+        }
+        case LAYER_CONV2D: {
+            Tensor* gw = tensor_conv_grad_weights(l->input, current_grad, l->stride, l->padding, col_workspace);
+            Tensor* gb = tensor_conv_grad_bias(current_grad);
+
+            // 그래디언트 누적
+            for (int j = 0; j < get_tensor_size(gw); ++j) l->grad_weights->values[j] += gw->values[j];
+            for (int j = 0; j < get_tensor_size(gb); ++j) l->grad_biases->values[j] += gb->values[j];
+
+            free_tensor(gw);
+            free_tensor(gb);
+            
+            next_grad = tensor_conv_grad_input(current_grad, l->weights, l->stride, l->padding, col_workspace);
+            break;
+        }
+        case LAYER_TRANSPOSED_CONV2D: {
+            // Transposed Conv의 역전파는 일반 Conv와 같음 (워크스페이스 전달)
+            next_grad = tensor_conv2d(current_grad, l->weights, l->biases, l->stride, 0, col_workspace);
+            break;
+        }
+        }
+        free_tensor(current_grad);
+        current_grad = next_grad;
+    }
+    return current_grad;
+}
+
+
+void unet_backward(UNetModel* model, UNetIntermediates* im, Tensor* grad_start) {
+    // 1. 역전파 연산을 위한 워크스페이스 생성 (순전파와 별개)
+    //    이 워크스페이스는 역전파 과정에서 필요한 가장 큰 크기를 담을 수 있어야 합니다.
+    //    (여기서는 넉넉한 크기로 하드코딩하지만, 원래는 사전 계산이 필요합니다.)
+    long max_size = im->enc1_out->shape[1] * 3 * 3 * im->enc1_out->shape[2] * im->enc1_out->shape[3];
+    Tensor* col_workspace = create_tensor((int[]) { max_size }, 1);
+
+    // Final Conv
+    Tensor* current_grad = backward_block(&model->final_conv, grad_start, col_workspace);
+
+    // --- Decoder 2 ---
+    Tensor* grad_concat2 = backward_block(&model->dec_conv2, current_grad, col_workspace);
+    free_tensor(current_grad);
+
+    // Concat 역전파: 그래디언트를 두 갈래로 분리
+    Tensor* grad_dec2_up = create_tensor(model->dec_up2.layers[0].output->shape, model->dec_up2.layers[0].output->dims);
+    Tensor* grad_enc1_skip = create_tensor(im->enc1_out->shape, im->enc1_out->dims);
+    tensor_concatenate_backward(grad_dec2_up, grad_enc1_skip, grad_concat2, 1, grad_dec2_up->shape[1]);
+    free_tensor(grad_concat2);
+
+    current_grad = backward_block(&model->dec_up2, grad_dec2_up, col_workspace);
+    free_tensor(grad_dec2_up);
+
+    // --- Decoder 1 ---
+    Tensor* grad_concat1 = backward_block(&model->dec_conv1, current_grad, col_workspace);
+    free_tensor(current_grad);
+
+    Tensor* grad_dec1_up = create_tensor(model->dec_up1.layers[0].output->shape, model->dec_up1.layers[0].output->dims);
+    Tensor* grad_enc2_skip = create_tensor(im->enc2_out->shape, im->enc2_out->dims);
+    tensor_concatenate_backward(grad_dec1_up, grad_enc2_skip, grad_concat1, 1, grad_dec1_up->shape[1]);
+    free_tensor(grad_concat1);
+
+    current_grad = backward_block(&model->dec_up1, grad_dec1_up, col_workspace);
+    free_tensor(grad_dec1_up);
+
+    // --- Bottleneck ---
+    current_grad = backward_block(&model->bottleneck, current_grad, col_workspace);
+
+    // --- Encoder 2 ---
+    Tensor* grad_from_pool2 = tensor_maxpool_backward(current_grad, im->enc2_out, im->pool2_idx);
+    free_tensor(current_grad);
+    // Max-pool을 통과한 그래디언트와 Skip-connection에서 온 그래디언트를 합산
+    for (int i = 0; i < get_tensor_size(grad_from_pool2); ++i) {
+        grad_from_pool2->values[i] += grad_enc2_skip->values[i];
+    }
+    free_tensor(grad_enc2_skip);
+
+    current_grad = backward_block(&model->enc2, grad_from_pool2, col_workspace);
+    free_tensor(grad_from_pool2);
+
+    // --- Encoder 1 ---
+    Tensor* grad_from_pool1 = tensor_maxpool_backward(current_grad, im->enc1_out, im->pool1_idx);
+    free_tensor(current_grad);
+    // Max-pool을 통과한 그래디언트와 Skip-connection에서 온 그래디언트를 합산
+    for (int i = 0; i < get_tensor_size(grad_from_pool1); ++i) {
+        grad_from_pool1->values[i] += grad_enc1_skip->values[i];
+    }
+    free_tensor(grad_enc1_skip);
+
+    current_grad = backward_block(&model->enc1, grad_from_pool1, col_workspace);
+    free_tensor(grad_from_pool1);
+
+    // 최종적으로 남은 그래디언트 해제
+    free_tensor(current_grad);
+
+    // 2. 역전파 완료 후 워크스페이스 해제
+    free_tensor(col_workspace);
+}
+
+
+// --- 파라미터 업데이트 및 그래디언트 초기화 함수 ---
+static void update_block(Block* b, float lr) {
+    for (int i = 0; i < b->num_layers; ++i) {
+        if (b->layers[i].weights) {
+            int w_size = get_tensor_size(b->layers[i].weights);
+            int b_size = get_tensor_size(b->layers[i].biases);
+            for (int j = 0; j < w_size; ++j) {
+                b->layers[i].weights->values[j] -= lr * b->layers[i].grad_weights->values[j];
+            }
+            for (int j = 0; j < b_size; ++j) {
+                b->layers[i].biases->values[j] -= lr * b->layers[i].grad_biases->values[j];
+            }
+        }
+    }
+}
+
+void unet_update_params(UNetModel* model, float learning_rate) {
+    update_block(&model->enc1, learning_rate);
+    update_block(&model->enc2, learning_rate);
+    update_block(&model->bottleneck, learning_rate);
+    update_block(&model->dec_up1, learning_rate);
+    update_block(&model->dec_conv1, learning_rate);
+    update_block(&model->dec_up2, learning_rate);
+    update_block(&model->dec_conv2, learning_rate);
+    update_block(&model->final_conv, learning_rate);
+}
+
+static void zero_grads_block(Block* b) {
+    for (int i = 0; i < b->num_layers; ++i) {
+        if (b->layers[i].grad_weights) {
+            memset(b->layers[i].grad_weights->values, 0, get_tensor_size(b->layers[i].grad_weights) * sizeof(float));
+            memset(b->layers[i].grad_biases->values, 0, get_tensor_size(b->layers[i].grad_biases) * sizeof(float));
+        }
+    }
+}
+
+void unet_zero_grads(UNetModel* model) {
+    zero_grads_block(&model->enc1);
+    zero_grads_block(&model->enc2);
+    zero_grads_block(&model->bottleneck);
+    zero_grads_block(&model->dec_up1);
+    zero_grads_block(&model->dec_conv1);
+    zero_grads_block(&model->dec_up2);
+    zero_grads_block(&model->dec_conv2);
+    zero_grads_block(&model->final_conv);
+}
+```
+```cnn_unet.h
+#ifndef __CNN_UNET_H__
+#define __CNN_UNET_H__
+
+#include "tensor.h"
+
+// --- Structure Definitions ---
+typedef enum {
+    LAYER_CONV2D,
+    LAYER_RELU,
+    LAYER_TRANSPOSED_CONV2D
+} LayerType;
+
+typedef struct {
+    LayerType type;
+    Tensor *weights, *biases;
+    Tensor *grad_weights, *grad_biases;
+    int stride, padding;
+    
+    // Fields for storing the input and output of each layer
+    Tensor *input;
+    Tensor *output;
+} Layer;
+
+typedef struct {
+    Layer* layers;
+    int num_layers;
+} Block;
+
+typedef struct {
+    Block enc1, enc2, bottleneck, dec_up1, dec_conv1, dec_up2, dec_conv2, final_conv;
+} UNetModel;
+
+// UNetIntermediates structure: Stores tensors needed for skip-connections and backpropagation
+typedef struct {
+    Tensor *enc1_out;      // For dec2 skip connection
+    Tensor *enc2_out;      // For dec1 skip connection
+    Tensor *pool1_idx;     // For maxpool backward
+    Tensor *pool2_idx;     // For maxpool backward
+    Tensor *pred_mask;     // Final prediction result
+} UNetIntermediates;
+
+
+// --- Function Prototypes ---
+void unet_build(UNetModel* model);
+void unet_free(UNetModel* model);
+UNetIntermediates* unet_forward(UNetModel* model, Tensor* input);
+
+// [New Function Declaration]
+UNetIntermediates* unet_forward(UNetModel* model, Tensor* input);
+void unet_backward(UNetModel* model, UNetIntermediates* im, Tensor* grad_start);
+// ...
+
+// [New Function Declaration]
+static Tensor* backward_block(Block* b, Tensor* grad, Tensor* col_workspace);
+void unet_update_params(UNetModel* model, float learning_rate);
+void unet_zero_grads(UNetModel* model);
+
+// Additional function for freeing intermediate tensors
+void unet_free_intermediates(UNetIntermediates* im);
+
+#endif // __CNN_UNET_H__
+```
+```main.c
+#define _CRT_SECURE_NO_WARNINGS
+#include "cnn_unet.h"
+#include "tensor.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+
+// Functions for loading data and calculating loss, defined at the top of the program for clarity.
+// ... (load_preprocessed_data, mse_loss, mse_loss_backward, print_progress functions) ...
+void load_preprocessed_data(const char* path, int* num_samples, int* h, int* w, float** images, float** masks) {
+    char info_path[256], images_path[256], masks_path[256];
+    sprintf(info_path, "%s/info.txt", path);
+    sprintf(images_path, "%s/coco_images.bin", path);
+    sprintf(masks_path, "%s/coco_masks.bin", path);
+
+    FILE* f_info = fopen(info_path, "r");
+    if (!f_info) { printf("Error: Could not open info file at %s\n", info_path); exit(1); }
+    if (fscanf(f_info, "%d\n%d\n%d", num_samples, h, w) != 3) { printf("Error: Invalid format in info.txt\n"); exit(1); }
+    fclose(f_info);
+
+    long img_total_size = (long)(*num_samples) * (*h) * (*w);
+    *images = (float*)malloc(img_total_size * sizeof(float));
+    *masks = (float*)malloc(img_total_size * sizeof(float));
+    if (!(*images) || !(*masks)) { printf("Error: Memory allocation failed for dataset.\n"); exit(1); }
+
+    FILE* f_images = fopen(images_path, "rb");
+    if (!f_images) { printf("Error: Could not open images file at %s\n", images_path); exit(1); }
+    fread(*images, sizeof(float), img_total_size, f_images);
+    fclose(f_images);
+
+    FILE* f_masks = fopen(masks_path, "rb");
+    if (!f_masks) { printf("Error: Could not open masks file at %s\n", masks_path); exit(1); }
+    fread(*masks, sizeof(float), img_total_size, f_masks);
+    fclose(f_masks);
+
+    printf("Loaded %d samples of size %dx%d from '%s'\n", *num_samples, *h, *w, path);
+}
+
+float mse_loss(Tensor* pred, Tensor* target) {
+    int size = get_tensor_size(pred);
+    float loss = 0.0f;
+    for (int i = 0; i < size; ++i) {
+        float diff = pred->values[i] - target->values[i];
+        loss += diff * diff;
+    }
+    return loss / size;
+}
+
+Tensor* mse_loss_backward(Tensor* pred, Tensor* target) {
+    Tensor* grad = create_tensor(pred->shape, pred->dims);
+    int size = get_tensor_size(pred);
+    for (int i = 0; i < size; ++i) {
+        grad->values[i] = 2.0f * (pred->values[i] - target->values[i]) / size;
+    }
+    return grad;
+}
+
+void print_progress(int current, int total, float loss) {
+    int bar_width = 50;
+    float progress = (float)current / total;
+    int pos = bar_width * progress;
+
+    printf("\r[");
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < pos) printf("=");
+        else if (i == pos) printf(">");
+        else printf(" ");
+    }
+    printf("] %d/%d (%.1f%%) - Loss: %.6f", current, total, progress * 100.0f, loss);
+    fflush(stdout);
+}
+
+int main() {
+    srand((unsigned int)time(NULL));
+
+    int num_samples, IMG_H, IMG_W;
+    float* all_images_data, * all_masks_data;
+    load_preprocessed_data("./preprocessed_data", &num_samples, &IMG_H, &IMG_W, &all_images_data, &all_masks_data);
+
+    UNetModel model;
+    unet_build(&model);
+
+    int epochs = 5;
+    float learning_rate = 0.01f;
+    printf("\n--- Starting U-Net Training with COCO data ---\n");
+
+    for (int e = 0; e < epochs; ++e) {
+        printf("Epoch %d/%d\n", e + 1, epochs);
+        float epoch_loss = 0.0f;
+        for (int i = 0; i < num_samples; ++i) {
+            Tensor* input_image = create_tensor((int[]) { 1, 1, IMG_H, IMG_W }, 4);
+            Tensor* target_mask = create_tensor((int[]) { 1, 1, IMG_H, IMG_W }, 4);
+            long data_size = (long)IMG_H * IMG_W * sizeof(float);
+            memcpy(input_image->values, &all_images_data[(long)i * IMG_H * IMG_W], data_size);
+            memcpy(target_mask->values, &all_masks_data[(long)i * IMG_H * IMG_W], data_size);
+
+            // 1. Initialize gradients
+            unet_zero_grads(&model);
+
+            // 2. Forward pass
+            UNetIntermediates* im = unet_forward(&model, input_image);
+
+            // 3. Calculate loss and gradients
+            float loss = mse_loss(im->pred_mask, target_mask);
+            epoch_loss += loss;
+            Tensor* grad = mse_loss_backward(im->pred_mask, target_mask);
+
+            // 4. Backward pass
+            unet_backward(&model, im, grad);
+
+            // 5. Update parameters
+            unet_update_params(&model, learning_rate);
+
+            // --- [Memory Management] ---
+            // 6. Free intermediate tensors
+            free_tensor(grad);
+            unet_free_intermediates(im); // unet_free_intermediates frees all tensors within the im struct
+            free_tensor(input_image);
+            free_tensor(target_mask);
+            // --- [End of Memory Management] ---
+
+            // Update progress bar
+            print_progress(i + 1, num_samples, epoch_loss / (i + 1));
+        }
+        printf("\nEpoch %d/%d - Average Loss: %f\n\n", e + 1, epochs, epoch_loss / num_samples);
+    }
+
+    unet_free(&model); // Free all allocated memory for the model
+    free(all_images_data);
+    free(all_masks_data);
+    printf("--- Training Finished ---\n");
+
+    return 0;
+}
+```
+```math_utils.c
+#include "math_utils.h"
+#include "tensor.h"
+#include <math.h>
+#include <assert.h>
+#include <immintrin.h> // AVX, AVX2, FMA 사용을 위한 헤더
+
 void relu(Tensor* t) {
     int total_elements = get_tensor_size(t);
-    for (int i = 0; i < total_elements; i++) {
-        if (t->values[i] < 0) {
-            t->values[i] = 0.0f;
+    float* p = t->values;
+    __m256 ymm_zeros = _mm256_setzero_ps(); // 모든 값이 0.0f인 AVX 레지스터
+
+    int i = 0;
+    // 8개씩 묶어 병렬 처리
+    for (; i <= total_elements - 8; i += 8) {
+        // 1. 메모리에서 8개의 float 값을 AVX 레지스터(ymm_vals)로 로드합니다.
+        __m256 ymm_vals = _mm256_loadu_ps(p + i);
+        // 2. ymm_vals와 ymm_zeros의 각 원소를 비교하여 더 큰 값을 선택합니다.
+        ymm_vals = _mm256_max_ps(ymm_vals, ymm_zeros);
+        // 3. 결과를 다시 메모리에 저장합니다.
+        _mm256_storeu_ps(p + i, ymm_vals);
+    }
+
+    // 8개로 나누어 떨어지지 않는 나머지 원소들을 순차적으로 처리합니다.
+    for (; i < total_elements; i++) {
+        if (p[i] < 0) {
+            p[i] = 0.0f;
         }
     }
 }
 
 void relu_derivative(Tensor* t) {
     int total_elements = get_tensor_size(t);
-    for (int i = 0; i < total_elements; i++) {
-        t->values[i] = t->values[i] > 0 ? 1.0f : 0.0f;
+    float* p = t->values;
+    __m256 ymm_zeros = _mm256_setzero_ps();
+    __m256 ymm_ones = _mm256_set1_ps(1.0f); // 모든 값이 1.0f인 AVX 레지스터
+
+    int i = 0;
+    for (; i <= total_elements - 8; i += 8) {
+        __m256 ymm_vals = _mm256_loadu_ps(p + i);
+        // 1. ymm_vals > 0.0f 인지 비교합니다. 결과는 마스크(mask)로 반환됩니다.
+        //    (해당 조건이 참이면 모든 비트가 1, 거짓이면 모든 비트가 0)
+        __m256 ymm_mask = _mm256_cmp_ps(ymm_vals, ymm_zeros, _CMP_GT_OQ);
+        // 2. 마스크를 사용하여 1.0f(참일 경우) 또는 0.0f(거짓일 경우)를 선택합니다.
+        __m256 ymm_result = _mm256_and_ps(ymm_mask, ymm_ones);
+        _mm256_storeu_ps(p + i, ymm_result);
+    }
+
+    for (; i < total_elements; i++) {
+        p[i] = p[i] > 0 ? 1.0f : 0.0f;
     }
 }
 
+// softmax는 각 행의 최대값, 합계를 구해야 하므로 AVX 적용이 복잡하고
+// 전체 성능에 미치는 영향이 적어 최적화 우선순위에서 제외합니다.
 void softmax(Tensor* t) {
     assert(t->dims == 2);
     for (int i = 0; i < t->shape[0]; i++) {
@@ -543,6 +1058,7 @@ void relu_derivative(Tensor* t);
 void softmax(Tensor* t);
 
 #endif // !__MATH_UTILS_H__
+
 ```
 ```matrix.c
 #include "matrix.h"
@@ -739,6 +1255,630 @@ Matrix mat_transpose(Matrix* mat);
 Matrix mat_elemwise_mul(Matrix* mat1, Matrix* mat2);
 
 #endif // !__MATRIX_H__
+
+```
+```tensor.c
+#include "tensor.h"
+#include <string.h>
+#include <assert.h>
+#include <stdlib.h>
+#include <float.h>
+#include <stdio.h>
+#include <immintrin.h>
+#include <omp.h>
+
+// --- Tensor creation and memory management ---
+Tensor* create_tensor(const int* shape, int dims) {
+    return create_tensor_from_array(NULL, shape, dims);
+}
+
+Tensor* create_tensor_from_array(const float* values, const int* shape, int dims) {
+    Tensor* t = (Tensor*)malloc(sizeof(Tensor));
+    assert(t != NULL);
+
+    t->dims = dims;
+    t->shape = (int*)malloc(dims * sizeof(int));
+    assert(t->shape != NULL);
+    memcpy(t->shape, shape, dims * sizeof(int));
+
+    int total_elements = get_tensor_size(t);
+    t->values = (float*)malloc(total_elements * sizeof(float));
+    assert(t->values != NULL);
+
+    if (values != NULL) {
+        memcpy(t->values, values, total_elements * sizeof(float));
+    }
+    else {
+        memset(t->values, 0, total_elements * sizeof(float));
+    }
+    return t;
+}
+
+Tensor* copy_tensor(const Tensor* src) {
+    return create_tensor_from_array(src->values, src->shape, src->dims);
+}
+
+void free_tensor(Tensor* tensor) {
+    if (tensor == NULL) {
+        return;
+    }
+    for (int i = 0; i < tensor->num_matrices; i++) {
+        free_matrix(tensor->matrices[i]);
+    }
+    free(tensor->matrices);
+    free(tensor);
+}
+
+int get_tensor_size(const Tensor* t) {
+    if (!t) return 0;
+    int size = 1;
+    for (int i = 0; i < t->dims; i++) {
+        size *= t->shape[i];
+    }
+    return size;
+}
+
+void print_tensor(const Tensor* t, int print_values) {
+    if (!t) {
+        printf("NULL Tensor\n");
+        return;
+    }
+    printf("Tensor (dims=%d): [", t->dims);
+    for (int i = 0; i < t->dims; i++) {
+        printf("%d%s", t->shape[i], i == t->dims - 1 ? "" : ", ");
+    }
+    printf("], Total elements: %d\n", get_tensor_size(t));
+    if (print_values) {
+        int size = get_tensor_size(t);
+        for (int i = 0; i < size && i < 10; i++) { // Print first 10 values
+            printf("%f ", t->values[i]);
+        }
+        if (size > 10) printf("...");
+        printf("\n");
+    }
+}
+
+
+// --- Basic operations ---
+void tensor_update(Tensor* t, const Tensor* grad, float learning_rate, int batch_size) {
+    int size = get_tensor_size(t);
+    for (int i = 0; i < size; i++) {
+        t->values[i] -= (learning_rate * grad->values[i]) / batch_size;
+    }
+}
+
+void tensor_reshape(Tensor* t, int* new_shape, int new_dims) {
+    int old_size = get_tensor_size(t);
+    int new_size = 1;
+    for (int i = 0; i < new_dims; i++) {
+        new_size *= new_shape[i];
+    }
+    assert(old_size == new_size);
+
+    free(t->shape);
+    t->shape = (int*)malloc(new_dims * sizeof(int));
+    memcpy(t->shape, new_shape, new_dims * sizeof(int));
+    t->dims = new_dims;
+}
+
+Tensor* tensor_sub(const Tensor* t1, const Tensor* t2) {
+    assert(get_tensor_size(t1) == get_tensor_size(t2));
+    Tensor* result = copy_tensor(t1);
+    int size = get_tensor_size(result);
+    float* p_res = result->values;
+    const float* p2 = t2->values;
+
+    int i = 0;
+    for (; i <= size - 8; i += 8) {
+        __m256 ymm1 = _mm256_loadu_ps(p_res + i);
+        __m256 ymm2 = _mm256_loadu_ps(p2 + i);
+        __m256 ymm_res = _mm256_sub_ps(ymm1, ymm2);
+        _mm256_storeu_ps(p_res + i, ymm_res);
+    }
+
+    for (; i < size; i++) {
+        p_res[i] -= p2[i];
+    }
+    return result;
+}
+
+Tensor* tensor_elemwise_mul(const Tensor* t1, const Tensor* t2) {
+    assert(get_tensor_size(t1) == get_tensor_size(t2));
+    Tensor* result = copy_tensor(t1);
+    int size = get_tensor_size(result);
+    float* p_res = result->values;
+    const float* p2 = t2->values;
+
+    int i = 0;
+    for (; i <= size - 8; i += 8) {
+        __m256 ymm1 = _mm256_loadu_ps(p_res + i);
+        __m256 ymm2 = _mm256_loadu_ps(p2 + i);
+        __m256 ymm_res = _mm256_mul_ps(ymm1, ymm2);
+        _mm256_storeu_ps(p_res + i, ymm_res);
+    }
+
+    for (; i < size; i++) {
+        p_res[i] *= p2[i];
+    }
+    return result;
+}
+
+Tensor* tensor_dot(const Tensor* t1, const Tensor* t2) {
+    assert(t1->dims == 2 && t2->dims == 2);
+    assert(t1->shape[1] == t2->shape[0]);
+
+    int m = t1->shape[0];
+    int k = t1->shape[1];
+    int n = t2->shape[1];
+
+    Tensor* result = create_tensor((int[]) { m, n }, 2);
+    float* p_res = result->values;
+    const float* p1 = t1->values;
+    const float* p2 = t2->values;
+
+
+    for (int i = 0; i < m; i++) {
+        for (int l = 0; l < k; l++) {
+            const float* p_t2 = p2 + l * n;
+            float* p_res_row = p_res + i * n;
+            register float val1 = p1[i * k + l];
+
+            int j = 0;
+            for (; j <= n - 8; j += 8) {
+                __m256 ymm_t2 = _mm256_loadu_ps(p_t2 + j);
+                __m256 ymm_res = _mm256_loadu_ps(p_res_row + j);
+
+                __m256 ymm_val1 = _mm256_set1_ps(val1);
+
+                
+                ymm_res = _mm256_fmadd_ps(ymm_val1, ymm_t2, ymm_res);
+
+                _mm256_storeu_ps(p_res_row + j, ymm_res);
+            }
+
+
+            for (; j < n; j++) {
+                p_res_row[j] += val1 * p_t2[j];
+            }
+        }
+    }
+    return result;
+}
+
+Tensor* tensor_transpose(const Tensor* t) {
+    assert(t->dims == 2);
+    Tensor* result = create_tensor((int[]) { t->shape[1], t->shape[0] }, 2);
+    for (int i = 0; i < t->shape[0]; i++) {
+        for (int j = 0; j < t->shape[1]; j++) {
+            result->values[j * t->shape[0] + i] = t->values[i * t->shape[1] + j];
+        }
+    }
+    return result;
+}
+
+Tensor* tensor_add_broadcast(const Tensor* main, const Tensor* broadcast) {
+    assert(main->dims == 2 && broadcast->dims == 2);
+    assert(main->shape[1] == broadcast->shape[1] && broadcast->shape[0] == 1);
+    Tensor* result = copy_tensor(main);
+    int M = main->shape[0];
+    int N = main->shape[1];
+
+    const float* p_br = broadcast->values;
+
+    for (int i = 0; i < M; i++) {
+        float* p_res_row = result->values + i * N;
+        int j = 0;
+        for (; j <= N - 8; j += 8) {
+            __m256 ymm_main = _mm256_loadu_ps(p_res_row + j);
+            __m256 ymm_br = _mm256_loadu_ps(p_br + j);
+            __m256 ymm_res = _mm256_add_ps(ymm_main, ymm_br);
+            _mm256_storeu_ps(p_res_row + j, ymm_res);
+        }
+
+        for (; j < N; j++) {
+            p_res_row[j] += p_br[j];
+        }
+    }
+    return result;
+}
+
+Tensor* tensor_sum_along_axis(const Tensor* t, int axis) {
+    assert(axis == 0 && t->dims == 2);
+    Tensor* result = create_tensor((int[]) { 1, t->shape[1] }, 2);
+    for (int j = 0; j < t->shape[1]; j++) {
+        float sum = 0.0f;
+        for (int i = 0; i < t->shape[0]; i++) {
+            sum += t->values[i * t->shape[1] + j];
+        }
+        result->values[j] = sum;
+    }
+    return result;
+}
+
+// --- CNN operations ---
+
+static void im2col(const float* data_im, int channels, int height, int width,
+    int kernel_h, int kernel_w, int stride_h, int stride_w,
+    int pad_h, int pad_w, float* data_col) {
+    int height_col = (height + 2 * pad_h - kernel_h) / stride_h + 1;
+    int width_col = (width + 2 * pad_w - kernel_w) / stride_w + 1;
+    int channels_col = channels * kernel_h * kernel_w;
+#pragma omp parallel for
+    for (int c = 0; c < channels_col; ++c) {
+        int w_offset = c % kernel_w;
+        int h_offset = (c / kernel_w) % kernel_h;
+        int c_im = c / (kernel_h * kernel_w);
+        for (int h = 0; h < height_col; ++h) {
+            for (int w = 0; w < width_col; ++w) {
+                int h_pad = h * stride_h - pad_h + h_offset;
+                int w_pad = w * stride_w - pad_w + w_offset;
+                if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width)
+                    data_col[(c * height_col + h) * width_col + w] = data_im[(c_im * height + h_pad) * width + w_pad];
+                else
+                    data_col[(c * height_col + h) * width_col + w] = 0;
+            }
+        }
+    }
+}
+
+static void col2im(const float* data_col, int channels, int height, int width,
+    int kernel_h, int kernel_w, int stride_h, int stride_w,
+    int pad_h, int pad_w, float* data_im) {
+    memset(data_im, 0, height * width * channels * sizeof(float));
+    int height_col = (height + 2 * pad_h - kernel_h) / stride_h + 1;
+    int width_col = (width + 2 * pad_w - kernel_w) / stride_w + 1;
+    int channels_col = channels * kernel_h * kernel_w;
+    for (int c = 0; c < channels_col; ++c) {
+        int w_offset = c % kernel_w;
+        int h_offset = (c / kernel_w) % kernel_h;
+        int c_im = c / (kernel_h * kernel_w);
+        for (int h = 0; h < height_col; ++h) {
+            for (int w = 0; w < width_col; ++w) {
+                int h_pad = h * stride_h - pad_h + h_offset;
+                int w_pad = w * stride_w - pad_w + w_offset;
+                if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width) {
+                    data_im[(c_im * height + h_pad) * width + w_pad] += data_col[(c * height_col + h) * width_col + w];
+                }
+            }
+        }
+    }
+}
+
+
+
+Tensor* tensor_conv2d(const Tensor* input, const Tensor* weights, const Tensor* biases,
+    int stride, int padding, Tensor* col_buffer) {
+
+    assert(input->dims == 4 && weights->dims == 4 && biases->dims == 1);
+    assert(input->shape[1] == weights->shape[1]);
+
+    int N = input->shape[0];
+    int C = input->shape[1];
+    int H = input->shape[2];
+    int W = input->shape[3];
+
+    int F = weights->shape[0];
+    int K = weights->shape[2];
+
+    int H_out = (H - K + 2 * padding) / stride + 1;
+    int W_out = (W - K + 2 * padding) / stride + 1;
+
+    int M_gemm = F;
+    int K_gemm = C * K * K;
+    int N_gemm = H_out * W_out;
+
+
+    assert(get_tensor_size(col_buffer) >= (long)K_gemm * N_gemm);
+
+    Tensor weights_reshaped = *weights;
+    weights_reshaped.dims = 2;
+    int new_shape[] = { M_gemm, K_gemm };
+    weights_reshaped.shape = new_shape;
+
+    Tensor* output = create_tensor((int[]) { N, F, H_out, W_out }, 4);
+
+    for (int i = 0; i < N; ++i) {
+        const float* input_image = input->values + i * C * H * W;
+        im2col(input_image, C, H, W, K, K, stride, stride, padding, padding, col_buffer->values);
+
+        int col_shape[] = { K_gemm, N_gemm };
+        col_buffer->shape = col_shape;
+        col_buffer->dims = 2;
+
+        Tensor* output_gemm = tensor_dot(&weights_reshaped, col_buffer);
+        assert(output_gemm->shape[0] == F && output_gemm->shape[1] == N_gemm);
+
+        float* output_ptr = output->values + i * F * N_gemm;
+        const float* gemm_ptr = output_gemm->values;
+
+#pragma omp parallel for
+        for (int f = 0; f < F; ++f) {
+            const float bias_val = biases->values[f];
+            float* out_channel_ptr = output_ptr + f * N_gemm;
+            const float* gemm_channel_ptr = gemm_ptr + f * N_gemm;
+            int j = 0;
+            __m256 ymm_bias = _mm256_set1_ps(bias_val);
+            for (; j <= N_gemm - 8; j += 8) {
+                __m256 ymm_gemm = _mm256_loadu_ps(gemm_channel_ptr + j);
+                __m256 ymm_res = _mm256_add_ps(ymm_gemm, ymm_bias);
+                _mm256_storeu_ps(out_channel_ptr + j, ymm_res);
+            }
+            for (; j < N_gemm; ++j) {
+                out_channel_ptr[j] = gemm_channel_ptr[j] + bias_val;
+            }
+        }
+
+        free_tensor(output_gemm);
+    }
+
+    return output;
+}
+
+Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** max_indices_tensor) {
+    assert(input->dims == 4);
+    int N = input->shape[0], C = input->shape[1], H = input->shape[2], W = input->shape[3];
+    int H_out = (H - pool_size) / stride + 1;
+    int W_out = (W - pool_size) / stride + 1;
+
+    Tensor* output = create_tensor((int[]) { N, C, H_out, W_out }, 4);
+    if (max_indices_tensor) {
+        *max_indices_tensor = create_tensor((int[]) { N, C, H_out, W_out }, 4);
+    }
+
+    for (int n = 0; n < N; n++)
+        for (int c = 0; c < C; c++)
+            for (int ho = 0; ho < H_out; ho++)
+                for (int wo = 0; wo < W_out; wo++) {
+                    float max_val = -FLT_MAX;
+                    int max_idx = -1;
+                    for (int ph = 0; ph < pool_size; ph++)
+                        for (int pw = 0; pw < pool_size; pw++) {
+                            int hi = ho * stride + ph;
+                            int wi = wo * stride + pw;
+                            int current_flat_idx = hi * W + wi;
+                            float val = input->values[n * C * H * W + c * H * W + current_flat_idx];
+                            if (val > max_val) {
+                                max_val = val;
+                                max_idx = current_flat_idx; // Store the 1D index of the 2D feature map
+                            }
+                        }
+                    output->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo] = max_val;
+                    if (max_indices_tensor) {
+                        (*max_indices_tensor)->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo] = (float)max_idx;
+                    }
+                }
+    return output;
+}
+
+// --- CNN backward pass ---
+
+Tensor* tensor_maxpool_backward(const Tensor* grad_output, const Tensor* original_input, const Tensor* max_indices) {
+    Tensor* grad_input = create_tensor(original_input->shape, original_input->dims); // Initialized to zeros
+    int N = grad_output->shape[0], C = grad_output->shape[1];
+    int H_out = grad_output->shape[2], W_out = grad_output->shape[3];
+    int H_in = original_input->shape[2], W_in = original_input->shape[3];
+
+    for (int n = 0; n < N; n++)
+        for (int c = 0; c < C; c++)
+            for (int ho = 0; ho < H_out; ho++)
+                for (int wo = 0; wo < W_out; wo++) {
+                    float grad = grad_output->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo];
+                    int max_idx_flat = (int)max_indices->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo];
+                    int grad_input_idx = n * C * H_in * W_in + c * H_in * W_in + max_idx_flat;
+                    grad_input->values[grad_input_idx] += grad; // Add gradient to the max value position
+                }
+    return grad_input;
+}
+
+Tensor* tensor_conv_grad_bias(const Tensor* grad_output) {
+    int F = grad_output->shape[1];
+    Tensor* grad_biases = create_tensor((int[]) { F }, 1);
+    int N = grad_output->shape[0], H_out = grad_output->shape[2], W_out = grad_output->shape[3];
+
+    for (int f = 0; f < F; f++) {
+        float sum = 0.0f;
+        for (int n = 0; n < N; n++)
+            for (int h = 0; h < H_out; h++)
+                for (int w = 0; w < W_out; w++) {
+                    sum += grad_output->values[n * F * H_out * W_out + f * H_out * W_out + h * W_out + w];
+                }
+        grad_biases->values[f] = sum;
+    }
+    return grad_biases;
+}
+
+Tensor* tensor_conv_grad_weights(const Tensor* input, const Tensor* grad_output,
+    int stride, int padding, Tensor* col_buffer) {
+    int N = input->shape[0];
+    int C = input->shape[1];
+    int H = input->shape[2];
+    int W = input->shape[3];
+
+    int F = grad_output->shape[1];
+    int H_out = grad_output->shape[2];
+    int W_out = grad_output->shape[3];
+    int K = (H + 2 * padding - H_out) / stride + 1;
+
+    int M_gemm = F;
+    int K_gemm_gw = C * K * K;
+    int N_gemm = H_out * W_out;
+
+    Tensor* grad_weights = create_tensor((int[]) { F, C, K, K }, 4);
+
+    for (int i = 0; i < N; ++i) {
+        const float* input_image = input->values + i * C * H * W;
+        const float* grad_output_image = grad_output->values + i * F * H_out * W_out;
+
+        im2col(input_image, C, H, W, K, K, stride, stride, padding, padding, col_buffer->values);
+
+        Tensor col_buffer_reshaped;
+        col_buffer_reshaped.dims = 2;
+        int col_shape[] = { K_gemm_gw, N_gemm };
+        col_buffer_reshaped.shape = col_shape;
+        col_buffer_reshaped.values = col_buffer->values;
+
+        Tensor grad_output_reshaped;
+        grad_output_reshaped.dims = 2;
+        int grad_output_shape[] = { M_gemm, N_gemm };
+        grad_output_reshaped.shape = grad_output_shape;
+        grad_output_reshaped.values = (float*)grad_output_image;
+
+        Tensor* col_buffer_T = tensor_transpose(&col_buffer_reshaped);
+        Tensor* gw_gemm = tensor_dot(&grad_output_reshaped, col_buffer_T);
+
+        for (int j = 0; j < get_tensor_size(gw_gemm); ++j) {
+            grad_weights->values[j] += gw_gemm->values[j];
+        }
+        free_tensor(col_buffer_T);
+        free_tensor(gw_gemm);
+    }
+    return grad_weights;
+}
+
+Tensor* tensor_conv_grad_input(const Tensor* grad_output, const Tensor* weights,
+    int stride, int padding, Tensor* col_buffer) {
+    int N = grad_output->shape[0];
+    int F = grad_output->shape[1];
+    int H_out = grad_output->shape[2];
+    int W_out = grad_output->shape[3];
+
+    int C = weights->shape[1];
+    int K = weights->shape[2];
+
+    int H = (H_out - 1) * stride + K - 2 * padding;
+    int W = (W_out - 1) * stride + K - 2 * padding;
+
+    Tensor* grad_input = create_tensor((int[]) { N, C, H, W }, 4);
+
+    int M_gemm_gi = C * K * K;
+    int N_gemm_gi = H_out * W_out;
+    int K_gemm_gi = F;
+
+    Tensor weights_T_proto = *weights;
+    weights_T_proto.dims = 2;
+    int w_shape[] = { K_gemm_gi, M_gemm_gi };
+    weights_T_proto.shape = w_shape;
+    Tensor* WT = tensor_transpose(&weights_T_proto);
+
+    for (int i = 0; i < N; ++i) {
+        const float* grad_output_image = grad_output->values + i * F * H_out * W_out;
+        Tensor grad_output_reshaped;
+        grad_output_reshaped.dims = 2;
+        int grad_shape[] = { K_gemm_gi, N_gemm_gi };
+        grad_output_reshaped.shape = grad_shape;
+        grad_output_reshaped.values = (float*)grad_output_image;
+
+        Tensor* dX_col = tensor_dot(WT, &grad_output_reshaped);
+
+        float* grad_input_image = grad_input->values + i * C * H * W;
+        col2im(dX_col->values, C, H, W, K, K, stride, stride, padding, padding, grad_input_image);
+        free_tensor(dX_col);
+    }
+
+    free_tensor(WT);
+    return grad_input;
+}
+
+
+
+Tensor* tensor_concatenate(Tensor* t1, Tensor* t2, int axis) {
+    assert(axis == 1 && t1->dims == 4 && t2->dims == 4 && t1->shape[0] == t2->shape[0] && t1->shape[2] == t2->shape[2] && t1->shape[3] == t2->shape[3]);
+    int N = t1->shape[0], C1 = t1->shape[1], C2 = t2->shape[1], H = t1->shape[2], W = t1->shape[3];
+    int C_out = C1 + C2;
+    size_t feature_map_size = (size_t)H * W;
+    Tensor* output = create_tensor((int[]) { N, C_out, H, W }, 4);
+    for (int n = 0; n < N; ++n) {
+        memcpy(output->values + n * C_out * feature_map_size, t1->values + n * C1 * feature_map_size, C1 * feature_map_size * sizeof(float));
+        memcpy(output->values + n * C_out * feature_map_size + C1 * feature_map_size, t2->values + n * C2 * feature_map_size, C2 * feature_map_size * sizeof(float));
+    }
+    return output;
+}
+
+
+void tensor_conv2d_backward(Tensor* grad_input, Tensor* grad_weights, Tensor* grad_biases, Tensor* grad_output, Tensor* input, Tensor* weights, int stride, int padding) {
+    int N = input->shape[0], C = input->shape[1], H = input->shape[2], W = input->shape[3];
+    int F = weights->shape[0], K = weights->shape[2];
+    int H_out = grad_output->shape[2], W_out = grad_output->shape[3];
+
+    for (int f = 0; f < F; f++) {
+        float sum = 0.0f;
+        for (int n = 0; n < N; n++) for (int h = 0; h < H_out; h++) for (int w = 0; w < W_out; w++)
+            sum += grad_output->values[n * F * H_out * W_out + f * H_out * W_out + h * W_out + w];
+        grad_biases->values[f] += sum;
+    }
+
+    for (int n = 0; n < N; n++) for (int f = 0; f < F; f++) for (int ho = 0; ho < H_out; ho++) for (int wo = 0; wo < W_out; wo++) {
+        float grad_out_val = grad_output->values[n * F * H_out * W_out + f * H_out * W_out + ho * W_out + wo];
+        for (int c = 0; c < C; c++) for (int kh = 0; kh < K; kh++) for (int kw = 0; kw < K; kw++) {
+            int hi = ho * stride + kh - padding, wi = wo * stride + kw - padding;
+            if (hi >= 0 && hi < H && wi >= 0 && wi < W) {
+                grad_weights->values[f * C * K * K + c * K * K + kh * K + kw] += input->values[n * C * H * W + c * H * W + hi * W + wi] * grad_out_val;
+                grad_input->values[n * C * H * W + c * H * W + hi * W + wi] += weights->values[f * C * K * K + c * K * K + kh * K + kw] * grad_out_val;
+            }
+        }
+    }
+}
+
+void tensor_transposed_conv2d_backward(Tensor* grad_input, Tensor* grad_weights, Tensor* grad_biases, Tensor* grad_output, Tensor* input, Tensor* weights, int stride) {
+    int N = input->shape[0], C_in = input->shape[1], H_in = input->shape[2], W_in = input->shape[3];
+    int C_out = weights->shape[1], K = weights->shape[2];
+    int H_out = grad_output->shape[2], W_out = grad_output->shape[3];
+
+    for (int c = 0; c < C_out; ++c) {
+        float sum = 0;
+        for (int n = 0; n < N; ++n) for (int h = 0; h < H_out; ++h) for (int w = 0; w < W_out; ++w)
+            sum += grad_output->values[n * C_out * H_out * W_out + c * H_out * W_out + h * W_out + w];
+        grad_biases->values[c] += sum;
+    }
+
+    for (int n = 0; n < N; ++n) for (int c_out = 0; c_out < C_out; ++c_out) for (int h_out = 0; h_out < H_out; ++h_out) for (int w_out = 0; w_out < W_out; ++w_out) {
+        float grad_out_val = grad_output->values[n * C_out * H_out * W_out + c_out * H_out * W_out + h_out * W_out + w_out];
+        for (int c_in = 0; c_in < C_in; ++c_in) for (int kh = 0; kh < K; ++kh) for (int kw = 0; kw < K; ++kw) {
+            int h_in_idx = (h_out - kh), w_in_idx = (w_out - kw);
+            if (h_in_idx >= 0 && h_in_idx % stride == 0 && w_in_idx >= 0 && w_in_idx % stride == 0) {
+                h_in_idx /= stride; w_in_idx /= stride;
+                if (h_in_idx < H_in && w_in_idx < W_in) {
+                    grad_input->values[n * C_in * H_in * W_in + c_in * H_in * W_in + h_in_idx * W_in + w_in_idx] += weights->values[c_in * C_out * K * K + c_out * K * K + kh * K + kw] * grad_out_val;
+                    grad_weights->values[c_in * C_out * K * K + c_out * K * K + kh * K + kw] += input->values[n * C_in * H_in * W_in + c_in * H_in * W_in + h_in_idx * W_in + w_in_idx] * grad_out_val;
+                }
+            }
+        }
+    }
+}
+
+void tensor_concatenate_backward(Tensor* grad_t1, Tensor* grad_t2, Tensor* grad_output, int axis, int c1_channels) {
+    assert(axis == 1);
+    int N = grad_output->shape[0], C_out = grad_output->shape[1], H = grad_output->shape[2], W = grad_output->shape[3];
+    int C1 = c1_channels, C2 = C_out - C1;
+    size_t feature_map_size = (size_t)H * W;
+    for (int n = 0; n < N; ++n) {
+        memcpy(grad_t1->values + n * C1 * feature_map_size, grad_output->values + n * C_out * feature_map_size, C1 * feature_map_size * sizeof(float));
+        memcpy(grad_t2->values + n * C2 * feature_map_size, grad_output->values + n * C_out * feature_map_size + C1 * feature_map_size, C2 * feature_map_size * sizeof(float));
+    }
+}
+Tensor* tensor_transposed_conv2d(Tensor* input, Tensor* weights, Tensor* biases, int stride) {
+    assert(input->dims == 4 && weights->dims == 4 && input->shape[1] == weights->shape[0]);
+    int N = input->shape[0], C_in = input->shape[1], H_in = input->shape[2], W_in = input->shape[3];
+    int C_out = weights->shape[1], K = weights->shape[2];
+    int H_out = (H_in - 1) * stride + K;
+    int W_out = (W_in - 1) * stride + K;
+
+    Tensor* output = create_tensor((int[]) { N, C_out, H_out, W_out }, 4);
+    for (int n = 0; n < N; ++n) for (int c_out = 0; c_out < C_out; ++c_out) for (int h_out = 0; h_out < H_out; ++h_out) for (int w_out = 0; w_out < W_out; ++w_out) {
+        float sum = 0.0f;
+        for (int c_in = 0; c_in < C_in; ++c_in) for (int kh = 0; kh < K; ++kh) for (int kw = 0; kw < K; ++kw) {
+            int h_in_idx = (h_out - kh), w_in_idx = (w_out - kw);
+            if (h_in_idx >= 0 && h_in_idx % stride == 0 && w_in_idx >= 0 && w_in_idx % stride == 0) {
+                h_in_idx /= stride; w_in_idx /= stride;
+                if (h_in_idx < H_in && w_in_idx < W_in) {
+                    sum += input->values[n * C_in * H_in * W_in + c_in * H_in * W_in + h_in_idx * W_in + w_in_idx] * weights->values[c_in * C_out * K * K + c_out * K * K + kh * K + kw];
+                }
+            }
+        }
+        output->values[n * C_out * H_out * W_out + c_out * H_out * W_out + h_out * W_out + w_out] = sum + biases->values[c_out];
+    }
+    return output;
+}
 ```
 ```tensor.h
 #ifndef __TENSOR_H__
@@ -748,19 +1888,20 @@ Matrix mat_elemwise_mul(Matrix* mat1, Matrix* mat2);
 #include <stdlib.h>
 
 typedef struct {
-    float* values;
-    int* shape;
-    int dims;
+    float* values; // Tensor Data
+    int* shape;    // Tensor Shape (e.g., [64, 1, 28, 28])
+    int dims;      // Tensor dimensions
 } Tensor;
 
-// --- 생명주기 ---
+
 Tensor* create_tensor(const int* shape, int dims);
 Tensor* create_tensor_from_array(const float* values, const int* shape, int dims);
 Tensor* copy_tensor(const Tensor* src);
 void free_tensor(Tensor* t);
 int get_tensor_size(const Tensor* t);
+void print_tensor(const Tensor* t, int print_values);
 
-// --- 기본 연산 ---
+
 void tensor_update(Tensor* t, const Tensor* grad, float learning_rate, int batch_size);
 void tensor_reshape(Tensor* t, int* new_shape, int new_dims);
 Tensor* tensor_sub(const Tensor* t1, const Tensor* t2);
@@ -770,182 +1911,28 @@ Tensor* tensor_transpose(const Tensor* t);
 Tensor* tensor_add_broadcast(const Tensor* mat_main, const Tensor* mat_broadcast);
 Tensor* tensor_sum_along_axis(const Tensor* t, int axis);
 
-// --- CNN 연산 ---
-Tensor* tensor_conv2d(const Tensor* input, const Tensor* weights, const Tensor* biases, int stride, int padding);
+
+Tensor* tensor_conv2d(const Tensor* input, const Tensor* weights, const Tensor* biases,
+    int stride, int padding, Tensor* col_buffer);
 Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** max_indices_tensor);
 
-// --- CNN 역전파 연산 ---
+
 Tensor* tensor_conv_grad_bias(const Tensor* grad_output);
-Tensor* tensor_conv_grad_weights(const Tensor* input, const Tensor* grad_output, int stride, int padding);
-Tensor* tensor_conv_grad_input(const Tensor* input, const Tensor* grad_output, const Tensor* weights, int stride, int padding);
-Tensor* tensor_maxpool_backward(const Tensor* grad_output, const Tensor* original_input_shape, const Tensor* max_indices, int pool_size, int stride);
+Tensor* tensor_conv_grad_weights(const Tensor* input, const Tensor* grad_output,
+    int stride, int padding, Tensor* col_buffer);
 
+Tensor* tensor_conv_grad_input(const Tensor* grad_output, const Tensor* weights,
+    int stride, int padding, Tensor* col_buffer);
+Tensor* tensor_maxpool_backward(const Tensor* grad_output, const Tensor* original_input, const Tensor* max_indices);
+
+Tensor* tensor_concatenate(Tensor* t1, Tensor* t2, int axis);
+void tensor_conv2d_backward(Tensor* grad_input, Tensor* grad_weights, Tensor* grad_biases, Tensor* grad_output, Tensor* input, Tensor* weights, int stride, int padding);
+void tensor_transposed_conv2d_backward(Tensor* grad_input, Tensor* grad_weights, Tensor* grad_biases, Tensor* grad_output, Tensor* input, Tensor* weights, int stride);
+void tensor_concatenate_backward(Tensor* grad_t1, Tensor* grad_t2, Tensor* grad_output, int axis, int c1_channels);
+
+Tensor* tensor_transposed_conv2d(Tensor* input, Tensor* weights, Tensor* biases, int stride);
 #endif // !__TENSOR_H__
-```
-```tesnor.c
-#include "tensor.h"
-#include <string.h>
-#include <assert.h>
-#include <stdlib.h>
-#include <float.h>
 
-// --- 기본 함수들 (이전과 동일) ---
-// create_tensor, copy_tensor, free_tensor, get_tensor_size, etc.
-
-// --- CNN 순전파 연산 ---
-
-Tensor* tensor_conv2d(const Tensor* input, const Tensor* weights, const Tensor* biases, int stride, int padding) {
-    // 입력: (N, C, H, W), 가중치: (F, C, K, K)
-    assert(input->dims == 4 && weights->dims == 4);
-    assert(input->shape[1] == weights->shape[1]); // 입력 채널 수 일치 확인
-
-    int N = input->shape[0];
-    int C = input->shape[1];
-    int H = input->shape[2];
-    int W = input->shape[3];
-    int F = weights->shape[0];
-    int K = weights->shape[2];
-
-    int H_out = (H - K + 2 * padding) / stride + 1;
-    int W_out = (W - K + 2 * padding) / stride + 1;
-
-    Tensor* output = create_tensor((int[]) { N, F, H_out, W_out }, 4);
-
-    for (int n = 0; n < N; ++n) { // 배치
-        for (int f = 0; f < F; ++f) { // 출력 필터
-            for (int h_o = 0; h_o < H_out; ++h_o) {
-                for (int w_o = 0; w_o < W_out; ++w_o) {
-                    float sum = 0.0f;
-                    for (int c = 0; c < C; ++c) { // 입력 채널
-                        for (int kh = 0; kh < K; ++kh) {
-                            for (int kw = 0; kw < K; ++kw) {
-                                int h_i = h_o * stride + kh - padding;
-                                int w_i = w_o * stride + kw - padding;
-                                if (h_i >= 0 && h_i < H && w_i >= 0 && w_i < W) {
-                                    float in_val = input->values[n * C * H * W + c * H * W + h_i * W + w_i];
-                                    float w_val = weights->values[f * C * K * K + c * K * K + kh * K + kw];
-                                    sum += in_val * w_val;
-                                }
-                            }
-                        }
-                    }
-                    output->values[n * F * H_out * W_out + f * H_out * W_out + h_o * W_out + w_o] = sum + biases->values[f];
-                }
-            }
-        }
-    }
-    return output;
-}
-
-Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** max_indices_tensor) {
-    assert(input->dims == 4);
-    int N = input->shape[0];
-    int C = input->shape[1];
-    int H = input->shape[2];
-    int W = input->shape[3];
-
-    int H_out = (H - pool_size) / stride + 1;
-    int W_out = (W - pool_size) / stride + 1;
-
-    Tensor* output = create_tensor((int[]) { N, C, H_out, W_out }, 4);
-    if (max_indices_tensor) {
-        *max_indices_tensor = create_tensor((int[]) { N, C, H_out, W_out }, 4);
-    }
-
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            for (int h_o = 0; h_o < H_out; ++h_o) {
-                for (int w_o = 0; w_o < W_out; ++w_o) {
-                    float max_val = -FLT_MAX;
-                    int max_idx = -1;
-                    for (int ph = 0; ph < pool_size; ++ph) {
-                        for (int pw = 0; pw < pool_size; ++pw) {
-                            int h_i = h_o * stride + ph;
-                            int w_i = w_o * stride + pw;
-                            int current_idx = n * C * H * W + c * H * W + h_i * W + w_i;
-                            float val = input->values[current_idx];
-                            if (val > max_val) {
-                                max_val = val;
-                                max_idx = h_i * W + w_i; // 2D 인덱스를 1D로 저장
-                            }
-                        }
-                    }
-                    output->values[n * C * H_out * W_out + c * H_out * W_out + h_o * W_out + w_o] = max_val;
-                    if (max_indices_tensor) {
-                        (*max_indices_tensor)->values[n * C * H_out * W_out + c * H_out * W_out + h_o * W_out + w_o] = (float)max_idx;
-                    }
-                }
-            }
-        }
-    }
-    return output;
-}
-
-// --- CNN 역전파 연산 ---
-
-Tensor* tensor_maxpool_backward(const Tensor* grad_output, const Tensor* original_input, const Tensor* max_indices, int pool_size, int stride) {
-    Tensor* grad_input = create_tensor(original_input->shape, original_input->dims); // 0으로 초기화됨
-    int N = grad_output->shape[0];
-    int C = grad_output->shape[1];
-    int H_out = grad_output->shape[2];
-    int W_out = grad_output->shape[3];
-    int W_in = original_input->shape[3];
-
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            for (int h = 0; h < H_out; ++h) {
-                for (int w = 0; w < W_out; ++w) {
-                    float grad = grad_output->values[n * C * H_out * W_out + c * H_out * W_out + h * W_out + w];
-                    int max_idx_1d = (int)max_indices->values[n * C * H_out * W_out + c * H_out * W_out + h * W_out + w];
-                    int grad_input_idx = n * C * original_input->shape[2] * W_in + c * original_input->shape[2] * W_in + max_idx_1d;
-                    grad_input->values[grad_input_idx] += grad;
-                }
-            }
-        }
-    }
-    return grad_input;
-}
-
-Tensor* tensor_conv_grad_bias(const Tensor* grad_output) {
-    int F = grad_output->shape[1];
-    Tensor* grad_biases = create_tensor((int[]) { F }, 1);
-    int N = grad_output->shape[0];
-    int H_out = grad_output->shape[2];
-    int W_out = grad_output->shape[3];
-
-    for (int f = 0; f < F; ++f) {
-        float sum = 0.0f;
-        for (int n = 0; n < N; ++n) {
-            for (int h = 0; h < H_out; ++h) {
-                for (int w = 0; w < W_out; ++w) {
-                    sum += grad_output->values[n * F * H_out * W_out + f * H_out * W_out + h * W_out + w];
-                }
-            }
-        }
-        grad_biases->values[f] = sum;
-    }
-    return grad_biases;
-}
-
-// 이 함수들은 실제 라이브러리에서는 최적화되지만, 여기서는 개념을 이해하기 쉽게 루프로 구현합니다.
-Tensor* tensor_conv_grad_weights(const Tensor* input, const Tensor* grad_output, int stride, int padding) {
-    // ... 구현이 매우 복잡하여 생략합니다. 실제로는 입력과 출력 그래디언트의 합성곱으로 계산됩니다.
-    // 임시로 0으로 채워진 그래디언트를 반환합니다.
-    int F = grad_output->shape[1];
-    int C = input->shape[1];
-    int K = 5; // 이 값은 동적으로 가져와야 함
-    return create_tensor((int[]) { F, C, K, K }, 4);
-}
-
-Tensor* tensor_conv_grad_input(const Tensor* input, const Tensor* grad_output, const Tensor* weights, int stride, int padding) {
-    // ... 구현이 매우 복잡하여 생략합니다. 실제로는 출력 그래디언트와 회전된 가중치의 'Full' 합성곱으로 계산됩니다.
-    // 임시로 0으로 채워진 그래디언트를 반환합니다.
-    return create_tensor(input->shape, input->dims);
-}
-
-// 참고: Conv2D의 역전파는 매우 복잡하여 교육용으로 C언어 밑바닥부터 구현하는 것은 큰 프로젝트입니다.
-// 위 코드에서는 MaxPool의 역전파만 완전하게 구현하고, Conv2D는 0-텐서를 반환하도록 했습니다.
-// 진정한 학습을 위해서는 이 부분(tensor_conv_grad_*)을 완성해야 합니다.
 ```
 ```utils.c
 #include "utils.h"
@@ -968,6 +1955,8 @@ void print_array_float(float* arr, int size) {
     }
     printf("]\n");
 }
+
+
 ```
 ```utils.h
 #ifndef __UTILS_H__
@@ -977,4 +1966,5 @@ void print_array_int(int* arr, int size);
 void print_array_float(float* arr, int size);
 
 #endif // !__UTILS_H__
+
 ```

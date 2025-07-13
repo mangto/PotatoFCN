@@ -33,6 +33,9 @@
     <ClCompile Include="tesnor.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="cnn_unet.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="utils.h">
@@ -48,6 +51,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tensor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="cnn_unet.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

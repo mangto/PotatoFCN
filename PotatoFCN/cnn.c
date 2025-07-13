@@ -6,12 +6,13 @@
 #include <math.h>
 #include <assert.h>
 
-// Backward pass function prototypes
+// --- Backward pass function prototypes ---
 static Tensor* backward_dense(Layer* l, Tensor* grad);
 static Tensor* backward_relu(Layer* l, Tensor* grad);
 static Tensor* backward_flatten(Layer* l, Tensor* grad);
-static Tensor* backward_conv2d(Layer* l, Tensor* grad);
+static Tensor* backward_conv2d(Layer* l, Tensor* grad, Tensor** col_workspace_ptr);
 static Tensor* backward_maxpool(Layer* l, Tensor* grad);
+
 
 
 // --- Model initialization and memory management ---
@@ -22,7 +23,9 @@ void model_init(Model* model) {
 
 void model_add_layer(Model* model, Layer layer) {
     model->num_layers++;
-    model->layers = (Layer*)realloc(model->layers, model->num_layers * sizeof(Layer));
+    Layer* new_layers = (Layer*)realloc(model->layers, model->num_layers * sizeof(Layer));
+    assert(new_layers != NULL && "Failed to reallocate memory for layers");
+    model->layers = new_layers;
     model->layers[model->num_layers - 1] = layer;
 }
 
@@ -30,14 +33,14 @@ void model_free(Model* model) {
     for (int i = 0; i < model->num_layers; i++) {
         Layer* l = &model->layers[i];
         if (l->type == LAYER_DENSE) {
-            free_tensor(l->params.dense.weights);
-            free_tensor(l->params.dense.biases);
+            if (l->params.dense.weights) free_tensor(l->params.dense.weights);
+            if (l->params.dense.biases) free_tensor(l->params.dense.biases);
             if (l->params.dense.grad_weights) free_tensor(l->params.dense.grad_weights);
             if (l->params.dense.grad_biases) free_tensor(l->params.dense.grad_biases);
         }
         else if (l->type == LAYER_CONV2D) {
-            free_tensor(l->params.conv2d.weights);
-            free_tensor(l->params.conv2d.biases);
+            if (l->params.conv2d.weights) free_tensor(l->params.conv2d.weights);
+            if (l->params.conv2d.biases) free_tensor(l->params.conv2d.biases);
             if (l->params.conv2d.grad_weights) free_tensor(l->params.conv2d.grad_weights);
             if (l->params.conv2d.grad_biases) free_tensor(l->params.conv2d.grad_biases);
         }
@@ -47,12 +50,11 @@ void model_free(Model* model) {
         if (l->input) free_tensor(l->input);
         if (l->output) free_tensor(l->output);
     }
-    free(model->layers);
+    if (model->layers) free(model->layers);
 }
 
 
 // --- Functions to add layers ---
-
 void model_add_dense(Model* model, int input_size, int output_size) {
     Layer l = { .type = LAYER_DENSE, .input = NULL, .output = NULL };
     l.params.dense.weights = create_tensor((int[]) { input_size, output_size }, 2);
@@ -60,7 +62,6 @@ void model_add_dense(Model* model, int input_size, int output_size) {
     l.params.dense.grad_weights = NULL;
     l.params.dense.grad_biases = NULL;
 
-    // He initialization
     float scale = sqrtf(2.0f / input_size);
     for (int i = 0; i < get_tensor_size(l.params.dense.weights); i++) {
         l.params.dense.weights->values[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * scale;
@@ -88,7 +89,6 @@ void model_add_conv2d(Model* model, int in_channels, int out_channels, int kerne
     l.params.conv2d.grad_weights = NULL;
     l.params.conv2d.grad_biases = NULL;
 
-    // He initialization
     float scale = sqrtf(2.0f / (in_channels * kernel_size * kernel_size));
     for (int i = 0; i < get_tensor_size(l.params.conv2d.weights); i++) {
         l.params.conv2d.weights->values[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * scale;
@@ -106,9 +106,9 @@ void model_add_maxpool(Model* model, int pool_size, int stride) {
 
 
 // --- Forward and backward pass ---
-
 Tensor* model_forward(Model* model, Tensor* input, int training) {
     Tensor* current_activation = copy_tensor(input);
+    Tensor* col_workspace = NULL;
 
     for (int i = 0; i < model->num_layers; i++) {
         Layer* l = &model->layers[i];
@@ -136,7 +136,6 @@ Tensor* model_forward(Model* model, Tensor* input, int training) {
             break;
         }
         case LAYER_FLATTEN: {
-            // [BUG FIX] Store input shape for backward pass
             if (training) {
                 l->params.flatten.input_dims = current_activation->dims;
                 for (int j = 0; j < current_activation->dims; ++j) {
@@ -148,7 +147,17 @@ Tensor* model_forward(Model* model, Tensor* input, int training) {
             break;
         }
         case LAYER_CONV2D: {
-            next_activation = tensor_conv2d(current_activation, l->params.conv2d.weights, l->params.conv2d.biases, l->params.conv2d.stride, l->params.conv2d.padding);
+            int C = current_activation->shape[1], H = current_activation->shape[2], W = current_activation->shape[3];
+            int K = l->params.conv2d.weights->shape[2], stride = l->params.conv2d.stride, padding = l->params.conv2d.padding;
+            int H_out = (H - K + 2 * padding) / stride + 1;
+            int W_out = (W - K + 2 * padding) / stride + 1;
+            long required_size = (long)(C * K * K) * (H_out * W_out);
+
+            if (col_workspace == NULL || get_tensor_size(col_workspace) < required_size) {
+                if (col_workspace) free_tensor(col_workspace);
+                col_workspace = create_tensor((int[]) { required_size }, 1);
+            }
+            next_activation = tensor_conv2d(current_activation, l->params.conv2d.weights, l->params.conv2d.biases, stride, padding, col_workspace);
             break;
         }
         case LAYER_MAXPOOL: {
@@ -172,12 +181,14 @@ Tensor* model_forward(Model* model, Tensor* input, int training) {
             l->output = copy_tensor(current_activation);
         }
     }
+
+    if (col_workspace) free_tensor(col_workspace);
     return current_activation;
 }
 
 void model_backward(Model* model, Tensor* y_pred, Tensor* y_true) {
-    // The gradient of Softmax with Cross-Entropy Loss is simply (y_pred - y_true).
     Tensor* grad = tensor_sub(y_pred, y_true);
+    Tensor* col_workspace = NULL;
 
     for (int i = model->num_layers - 1; i >= 0; i--) {
         Layer* l = &model->layers[i];
@@ -187,15 +198,18 @@ void model_backward(Model* model, Tensor* y_pred, Tensor* y_true) {
         case LAYER_DENSE:   grad_upstream = backward_dense(l, grad); break;
         case LAYER_RELU:    grad_upstream = backward_relu(l, grad); break;
         case LAYER_FLATTEN: grad_upstream = backward_flatten(l, grad); break;
-        case LAYER_CONV2D:  grad_upstream = backward_conv2d(l, grad); break;
+        case LAYER_CONV2D:
+            grad_upstream = backward_conv2d(l, grad, &col_workspace);
+            break;
         case LAYER_MAXPOOL: grad_upstream = backward_maxpool(l, grad); break;
-            // The Softmax layer is handled by the loss function, so the gradient is passed through.
         case LAYER_SOFTMAX: grad_upstream = copy_tensor(grad); break;
         }
 
         free_tensor(grad);
         grad = grad_upstream;
     }
+
+    if (col_workspace) free_tensor(col_workspace);
     if (grad) free_tensor(grad);
 }
 
@@ -220,22 +234,18 @@ void model_update_params(Model* model, float learning_rate, int batch_size) {
 
 // --- Backward pass for each layer type ---
 
-static Tensor* backward_conv2d(Layer* l, Tensor* grad) {
+static Tensor* backward_conv2d(Layer* l, Tensor* grad, Tensor** col_workspace_ptr) {
     Conv2DParams* cp = &l->params.conv2d;
     Tensor* input = l->input;
 
-    // Free previous gradients if they exist
-    if (cp->grad_biases) free_tensor(cp->grad_biases);
     if (cp->grad_weights) free_tensor(cp->grad_weights);
+    if (cp->grad_biases) free_tensor(cp->grad_biases);
 
-    // 1. Calculate bias gradient (dL/dB)
     cp->grad_biases = tensor_conv_grad_bias(grad);
 
-    // 2. Calculate weight gradient (dL/dW)
-    cp->grad_weights = tensor_conv_grad_weights(input, grad, cp->stride, cp->padding);
+    cp->grad_weights = tensor_conv_grad_weights(input, grad, cp->weights, cp->stride, cp->padding, col_workspace_ptr);
 
-    // 3. Calculate input gradient (dL/dX) - to be passed to the previous layer
-    Tensor* grad_upstream = tensor_conv_grad_input(grad, cp->weights, cp->stride, cp->padding, input->shape);
+    Tensor* grad_upstream = tensor_conv_grad_input(grad, cp->weights, cp->stride, cp->padding, *col_workspace_ptr);
 
     return grad_upstream;
 }
@@ -243,19 +253,15 @@ static Tensor* backward_conv2d(Layer* l, Tensor* grad) {
 static Tensor* backward_dense(Layer* l, Tensor* grad) {
     DenseParams* dp = &l->params.dense;
 
-    // Free previous gradients if they exist
     if (dp->grad_weights) free_tensor(dp->grad_weights);
     if (dp->grad_biases) free_tensor(dp->grad_biases);
 
-    // 1. Calculate weight gradient: dL/dW = X^T * dL/dY
     Tensor* XT = tensor_transpose(l->input);
     dp->grad_weights = tensor_dot(XT, grad);
     free_tensor(XT);
 
-    // 2. Calculate bias gradient: dL/db = sum(dL/dY)
     dp->grad_biases = tensor_sum_along_axis(grad, 0);
 
-    // 3. Calculate gradient to pass to the previous layer: dL/dX = dL/dY * W^T
     Tensor* WT = tensor_transpose(dp->weights);
     Tensor* grad_upstream = tensor_dot(grad, WT);
     free_tensor(WT);
@@ -264,8 +270,6 @@ static Tensor* backward_dense(Layer* l, Tensor* grad) {
 }
 
 static Tensor* backward_relu(Layer* l, Tensor* grad) {
-    // dL/dX = dL/dY * (dY/dX)
-    // The derivative of ReLU (dY/dX) is 1 if X > 0, and 0 otherwise.
     Tensor* deriv = copy_tensor(l->input);
     relu_derivative(deriv);
     Tensor* grad_upstream = tensor_elemwise_mul(grad, deriv);
@@ -274,14 +278,12 @@ static Tensor* backward_relu(Layer* l, Tensor* grad) {
 }
 
 static Tensor* backward_flatten(Layer* l, Tensor* grad) {
-    // Reshape the gradient to the shape before flattening.
     Tensor* grad_upstream = copy_tensor(grad);
     tensor_reshape(grad_upstream, l->params.flatten.input_shape, l->params.flatten.input_dims);
     return grad_upstream;
 }
 
 static Tensor* backward_maxpool(Layer* l, Tensor* grad) {
-    // Use the stored max indices to route the gradient to the correct locations.
     Tensor* grad_upstream = tensor_maxpool_backward(grad, l->input, l->params.maxpool.max_indices);
     return grad_upstream;
 }

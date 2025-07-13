@@ -102,6 +102,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -124,16 +125,18 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="cnn.c" />
+    <ClCompile Include="cnn_unet.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="math_utils.c" />
     <ClCompile Include="matrix.c">
       <DeploymentContent>false</DeploymentContent>
     </ClCompile>
-    <ClCompile Include="tesnor.c" />
+    <ClCompile Include="tensor.c" />
     <ClCompile Include="utils.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="cnn.h" />
+    <ClInclude Include="cnn_unet.h" />
     <ClInclude Include="math_utils.h" />
     <ClInclude Include="matrix.h">
       <DeploymentContent>false</DeploymentContent>
