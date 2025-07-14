@@ -7,6 +7,8 @@
 #include <immintrin.h>
 #include <omp.h>
 
+#include <cblas.h>
+
 // --- Tensor creation and memory management ---
 Tensor* create_tensor(const int* shape, int dims) {
     return create_tensor_from_array(NULL, shape, dims);
@@ -156,36 +158,18 @@ Tensor* tensor_dot(const Tensor* t1, const Tensor* t2) {
     int n = t2->shape[1];
 
     Tensor* result = create_tensor((int[]) { m, n }, 2);
-    float* p_res = result->values;
-    const float* p1 = t1->values;
-    const float* p2 = t2->values;
 
+    // cblas_sgemm(Order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)
+    cblas_sgemm(CblasRowMajor, // 행 우선 순서
+        CblasNoTrans,  // A는 Transpose 안함
+        CblasNoTrans,  // B도 Transpose 안함
+        m, n, k,       // M, N, K
+        1.0f,          // alpha (곱셈 계수)
+        t1->values, k, // A 행렬, lda (A의 열 개수)
+        t2->values, n, // B 행렬, ldb (B의 열 개수)
+        0.0f,          // beta (덧셈 계수, 0이면 덮어쓰기)
+        result->values, n); // C 행렬, ldc (C의 열 개수)
 
-    for (int i = 0; i < m; i++) {
-        for (int l = 0; l < k; l++) {
-            const float* p_t2 = p2 + l * n;
-            float* p_res_row = p_res + i * n;
-            register float val1 = p1[i * k + l];
-
-            int j = 0;
-            for (; j <= n - 8; j += 8) {
-                __m256 ymm_t2 = _mm256_loadu_ps(p_t2 + j);
-                __m256 ymm_res = _mm256_loadu_ps(p_res_row + j);
-
-                __m256 ymm_val1 = _mm256_set1_ps(val1);
-
-                
-                ymm_res = _mm256_fmadd_ps(ymm_val1, ymm_t2, ymm_res);
-
-                _mm256_storeu_ps(p_res_row + j, ymm_res);
-            }
-
-
-            for (; j < n; j++) {
-                p_res_row[j] += val1 * p_t2[j];
-            }
-        }
-    }
     return result;
 }
 
@@ -369,13 +353,16 @@ Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** 
         *max_indices_tensor = create_tensor((int[]) { N, C, H_out, W_out }, 4);
     }
 
-    for (int n = 0; n < N; n++)
-        for (int c = 0; c < C; c++)
-            for (int ho = 0; ho < H_out; ho++)
+    // 최적화 설명: N, C, H_out, W_out 4개 루프를 병렬화합니다.
+    // 작업 부하가 균일할 것으로 예상되므로 schedule(static)을 사용합니다.
+#pragma omp parallel for collapse(4) schedule(static)
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int ho = 0; ho < H_out; ho++) {
                 for (int wo = 0; wo < W_out; wo++) {
                     float max_val = -FLT_MAX;
                     int max_idx = -1;
-                    for (int ph = 0; ph < pool_size; ph++)
+                    for (int ph = 0; ph < pool_size; ph++) {
                         for (int pw = 0; pw < pool_size; pw++) {
                             int hi = ho * stride + ph;
                             int wi = wo * stride + pw;
@@ -383,34 +370,47 @@ Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** 
                             float val = input->values[n * C * H * W + c * H * W + current_flat_idx];
                             if (val > max_val) {
                                 max_val = val;
-                                max_idx = current_flat_idx; // Store the 1D index of the 2D feature map
+                                max_idx = current_flat_idx;
                             }
                         }
+                    }
                     output->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo] = max_val;
                     if (max_indices_tensor) {
                         (*max_indices_tensor)->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo] = (float)max_idx;
                     }
                 }
+            }
+        }
+    }
     return output;
 }
 
 // --- CNN backward pass ---
-
 Tensor* tensor_maxpool_backward(const Tensor* grad_output, const Tensor* original_input, const Tensor* max_indices) {
-    Tensor* grad_input = create_tensor(original_input->shape, original_input->dims); // Initialized to zeros
+    Tensor* grad_input = create_tensor(original_input->shape, original_input->dims); // 0으로 초기화
     int N = grad_output->shape[0], C = grad_output->shape[1];
     int H_out = grad_output->shape[2], W_out = grad_output->shape[3];
     int H_in = original_input->shape[2], W_in = original_input->shape[3];
 
-    for (int n = 0; n < N; n++)
-        for (int c = 0; c < C; c++)
-            for (int ho = 0; ho < H_out; ho++)
+    // 최적화 설명: 4개의 외부 루프를 합쳐서 병렬화합니다.
+#pragma omp parallel for collapse(4) schedule(static)
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int ho = 0; ho < H_out; ho++) {
                 for (int wo = 0; wo < W_out; wo++) {
                     float grad = grad_output->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo];
                     int max_idx_flat = (int)max_indices->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo];
                     int grad_input_idx = n * C * H_in * W_in + c * H_in * W_in + max_idx_flat;
-                    grad_input->values[grad_input_idx] += grad; // Add gradient to the max value position
+
+                    // 주의: 이 연산은 원자적(atomic)이어야 할 수 있으나, max-pooling의 특성상
+                    // 서로 다른 (ho, wo)가 같은 grad_input_idx에 접근할 확률이 거의 없어 일반적으로 안전합니다.
+                    // 만약의 경우를 대비해 atomic을 사용할 수 있습니다.
+#pragma omp atomic
+                    grad_input->values[grad_input_idx] += grad;
                 }
+            }
+        }
+    }
     return grad_input;
 }
 
@@ -419,13 +419,19 @@ Tensor* tensor_conv_grad_bias(const Tensor* grad_output) {
     Tensor* grad_biases = create_tensor((int[]) { F }, 1);
     int N = grad_output->shape[0], H_out = grad_output->shape[2], W_out = grad_output->shape[3];
 
+    // 최적화 설명: 각 필터(f)에 대한 계산은 독립적이므로 외부 루프를 병렬화합니다.
+    // 이것이 이 함수 구조에 가장 적합한 병렬화 방식입니다.
+#pragma omp parallel for schedule(static)
     for (int f = 0; f < F; f++) {
         float sum = 0.0f;
-        for (int n = 0; n < N; n++)
-            for (int h = 0; h < H_out; h++)
+        // 이 내부 루프들은 각 스레드가 독립적으로 실행합니다.
+        for (int n = 0; n < N; n++) {
+            for (int h = 0; h < H_out; h++) {
                 for (int w = 0; w < W_out; w++) {
                     sum += grad_output->values[n * F * H_out * W_out + f * H_out * W_out + h * W_out + w];
                 }
+            }
+        }
         grad_biases->values[f] = sum;
     }
     return grad_biases;

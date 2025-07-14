@@ -51,7 +51,7 @@ void unet_backward(UNetModel* model, UNetIntermediates* im, Tensor* grad_start);
 // ...
 
 // [New Function Declaration]
-static Tensor* backward_block(Block* b, Tensor* grad, Tensor* col_workspace);
+static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace);
 void unet_update_params(UNetModel* model, float learning_rate);
 void unet_zero_grads(UNetModel* model);
 

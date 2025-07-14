@@ -30,10 +30,10 @@
     <ClCompile Include="matrix.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="tesnor.c">
+    <ClCompile Include="cnn_unet.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="cnn_unet.c">
+    <ClCompile Include="tensor.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
