@@ -2,6 +2,10 @@
 #define __CNN_UNET_H__
 
 #include "tensor.h"
+#include "conv_bwd_data_primitive.h"
+#include "conv_bwd_weights_primitive.h"
+
+#include <stdbool.h>
 
 // --- Structure Definitions ---
 typedef enum {
@@ -20,10 +24,16 @@ typedef struct {
     Tensor *input;
     Tensor *output;
 } Layer;
-
 typedef struct {
     Layer* layers;
-    int num_layers;
+    int    num_layers;
+    // oneDNN backward primitives (lazy init ¿ë)
+    ConvBwdWeightsPrimitive* conv_w_prims;
+    ConvBwdDataPrimitive* conv_d_prims;
+    ConvBwdWeightsPrimitive* deconv_w_prims;
+    ConvBwdDataPrimitive* deconv_d_prims;
+    // init flag
+    bool* prim_inited;
 } Block;
 
 typedef struct {
@@ -57,5 +67,8 @@ void unet_zero_grads(UNetModel* model);
 
 // Additional function for freeing intermediate tensors
 void unet_free_intermediates(UNetIntermediates* im);
+
+static void clip_block_gradients(Block* b, float clip_val);
+void clip_gradients(UNetModel* m, float clip_val);
 
 #endif // __CNN_UNET_H__

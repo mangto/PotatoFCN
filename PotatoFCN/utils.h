@@ -1,7 +1,20 @@
-#ifndef __UTILS_H__
-#define __UTILS_H__
+#ifndef UTILS_H
+#define UTILS_H
 
-void print_array_int(int* arr, int size);
-void print_array_float(float* arr, int size);
+#include "tensor.h"
 
-#endif // !__UTILS_H__
+// Dataset loading
+void load_preprocessed_data(
+    const char* path,
+    int* num_samples,
+    int* h,
+    int* w,
+    float** images,
+    float** masks
+);
+
+// Loss functions
+double mse_loss(const Tensor* pred, const Tensor* target);
+Tensor* mse_loss_backward(const Tensor* pred, const Tensor* target);
+
+#endif // UTILS_H

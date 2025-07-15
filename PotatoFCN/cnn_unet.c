@@ -65,14 +65,34 @@ static void block_free(Block* b) {
 }
 
 void unet_free(UNetModel* model) {
-    block_free(&model->enc1);
-    block_free(&model->enc2);
-    block_free(&model->bottleneck);
-    block_free(&model->dec_up1);
-    block_free(&model->dec_conv1);
-    block_free(&model->dec_up2);
-    block_free(&model->dec_conv2);
-    block_free(&model->final_conv);
+    Block* blocks[] = {
+        &model->enc1, &model->enc2, &model->bottleneck,
+        &model->dec_up1, &model->dec_conv1,
+        &model->dec_up2, &model->dec_conv2,
+        &model->final_conv
+    };
+    for (int bi = 0; bi < sizeof(blocks) / sizeof(*blocks); ++bi) {
+        Block* b = blocks[bi];
+        for (int i = 0; i < b->num_layers; ++i) {
+            Layer* l = &b->layers[i];
+            if (b->prim_inited[i]) {
+                if (l->type == LAYER_CONV2D) {
+                    conv_bwd_weights_primitive_destroy(&b->conv_w_prims[i]);
+                    conv_bwd_data_primitive_destroy(&b->conv_d_prims[i]);
+                }
+                else if (l->type == LAYER_TRANSPOSED_CONV2D) {
+                    conv_bwd_weights_primitive_destroy(&b->deconv_w_prims[i]);
+                    conv_bwd_data_primitive_destroy(&b->deconv_d_prims[i]);
+                }
+            }
+        }
+        free(b->conv_w_prims);
+        free(b->conv_d_prims);
+        free(b->deconv_w_prims);
+        free(b->deconv_d_prims);
+        free(b->prim_inited);
+        block_free(b);
+    }
 }
 
 void unet_free_intermediates(UNetIntermediates* im) {
@@ -123,6 +143,7 @@ void unet_build(UNetModel* model) {
     // Decoder Block 2 (Upsampling + Convolution)
     block_init(&model->dec_up2);
     add_transposed_conv(&model->dec_up2, 32, 16, 2, 2);
+    add_relu(&model->dec_up2);
 
     block_init(&model->dec_conv2);
     add_conv(&model->dec_conv2, 32, 16, 3, 1, 1); // Concat: 16(up) + 16(skip)
@@ -133,7 +154,26 @@ void unet_build(UNetModel* model) {
     // Final Layer
     block_init(&model->final_conv);
     add_conv(&model->final_conv, 16, 1, 1, 1, 0); // 1x1 Convolution
+
+    // 모든 Block 에 대해 backward primitives 배열만 할당(calloc 초기화)
+    Block* blocks[] = {
+        &model->enc1, &model->enc2, &model->bottleneck,
+        &model->dec_up1, &model->dec_conv1,
+        &model->dec_up2, &model->dec_conv2,
+        &model->final_conv
+    };
+    int num_blocks = sizeof(blocks) / sizeof(blocks[0]);
+    for (int bi = 0; bi < num_blocks; ++bi) {
+        Block* b = blocks[bi];
+        int L = b->num_layers;
+        b->conv_w_prims = malloc(L * sizeof(*b->conv_w_prims));
+        b->conv_d_prims = malloc(L * sizeof(*b->conv_d_prims));
+        b->deconv_w_prims = malloc(L * sizeof(*b->deconv_w_prims));
+        b->deconv_d_prims = malloc(L * sizeof(*b->deconv_d_prims));
+        b->prim_inited = calloc(L, sizeof(*b->prim_inited));
+    }
 }
+
 
 static Tensor* forward_block(Block* b, Tensor* input, Tensor** col_workspace_ptr) {
     Tensor* current = copy_tensor(input);
@@ -167,13 +207,43 @@ static Tensor* forward_block(Block* b, Tensor* input, Tensor** col_workspace_ptr
     return current;
 }
 
-
 static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr) {
     Tensor* current_grad = copy_tensor(grad);
+
     for (int i = b->num_layers - 1; i >= 0; --i) {
         Layer* l = &b->layers[i];
         Tensor* next_grad = NULL;
 
+        // ─── 1) LAZY?INIT PRIMITIVES FOR THIS LAYER ───
+        if (!b->prim_inited[i] &&
+            (l->type == LAYER_CONV2D || l->type == LAYER_TRANSPOSED_CONV2D)) {
+            // l->input is now non?NULL because forward has been called
+            int N = l->input->shape[0];
+            int C = l->input->shape[1];
+            int H = l->input->shape[2];
+            int W = l->input->shape[3];
+            int F = l->weights->shape[0];
+            int K = l->weights->shape[2];
+            int s = l->stride;
+            int p = (l->type == LAYER_CONV2D ? l->padding : 0);
+
+            if (l->type == LAYER_CONV2D) {
+                conv_bwd_weights_primitive_init(
+                    &b->conv_w_prims[i], N, C, H, W, F, K, s, p);
+                conv_bwd_data_primitive_init(
+                    &b->conv_d_prims[i], N, C, H, W, F, K, s, p);
+            }
+            else {
+                // transposed?conv backward uses same init signature but no padding
+                conv_bwd_weights_primitive_init(
+                    &b->deconv_w_prims[i], N, C, H, W, F, K, s, p);
+                conv_bwd_data_primitive_init(
+                    &b->deconv_d_prims[i], N, C, H, W, F, K, s, p);
+            }
+            b->prim_inited[i] = true;
+        }
+
+        // ─── 2) ACTUAL BACKPROP ───
         switch (l->type) {
         case LAYER_RELU: {
             Tensor* deriv = copy_tensor(l->input);
@@ -183,43 +253,61 @@ static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr
             break;
         }
         case LAYER_CONV2D: {
-            assert(l->input != NULL && l->weights != NULL);
-
-            Tensor* gw = tensor_conv_grad_weights(l->input, current_grad, l->weights, l->stride, l->padding, col_workspace_ptr);
-            Tensor* gb = tensor_conv_grad_bias(current_grad);
-
-            for (int j = 0; j < get_tensor_size(gw); ++j) l->grad_weights->values[j] += gw->values[j];
-            for (int j = 0; j < get_tensor_size(gb); ++j) l->grad_biases->values[j] += gb->values[j];
-
+            // 2a) weight?grad
+            Tensor* gw = conv_bwd_weights_primitive_execute(
+                &b->conv_w_prims[i],
+                l->input,
+                current_grad
+            );
+            for (int j = 0; j < get_tensor_size(gw); ++j)
+                l->grad_weights->values[j] += gw->values[j];
             free_tensor(gw);
+
+            // 2b) bias?grad
+            Tensor* gb = tensor_conv_grad_bias(current_grad);
+            for (int j = 0; j < get_tensor_size(gb); ++j)
+                l->grad_biases->values[j] += gb->values[j];
             free_tensor(gb);
 
-            next_grad = tensor_conv_grad_input(current_grad, l->weights, l->stride, l->padding, *col_workspace_ptr);
+            // 2c) input?grad
+            next_grad = conv_bwd_data_primitive_execute(
+                &b->conv_d_prims[i],
+                current_grad,
+                l->weights
+            );
             break;
         }
         case LAYER_TRANSPOSED_CONV2D: {
-            assert(l->input != NULL && l->weights != NULL);
-
-            Tensor* gw = tensor_conv_grad_weights(l->input, current_grad, l->weights, l->stride, l->padding, col_workspace_ptr);
-            Tensor* gb = tensor_conv_grad_bias(current_grad);
-
-            for (int j = 0; j < get_tensor_size(gw); ++j) l->grad_weights->values[j] += gw->values[j];
-            for (int j = 0; j < get_tensor_size(gb); ++j) l->grad_biases->values[j] += gb->values[j];
-
+            // FALLBACK to CPU code for deconv
+            Tensor* gw = tensor_conv_grad_weights(
+                l->input, current_grad, l->weights, l->stride, 0, col_workspace_ptr);
+            for (int j = 0; j < get_tensor_size(gw); ++j)
+                l->grad_weights->values[j] += gw->values[j];
             free_tensor(gw);
+
+            Tensor* gb = tensor_conv_grad_bias(current_grad);
+            for (int j = 0; j < get_tensor_size(gb); ++j)
+                l->grad_biases->values[j] += gb->values[j];
             free_tensor(gb);
 
             Tensor* zero_bias = create_tensor((int[]) { l->biases->shape[0] }, 1);
-            next_grad = tensor_conv2d(current_grad, l->weights, zero_bias, l->stride, l->padding, col_workspace_ptr);
+            next_grad = tensor_conv2d(
+                current_grad, l->weights, zero_bias, l->stride, 0, col_workspace_ptr);
             free_tensor(zero_bias);
             break;
         }
+        default:
+            assert(!"Unknown layer type in backward_block");
         }
+
         free_tensor(current_grad);
         current_grad = next_grad;
     }
+
     return current_grad;
 }
+
+
 
 
 UNetIntermediates* unet_forward(UNetModel* model, Tensor* input) {
@@ -375,4 +463,36 @@ void unet_zero_grads(UNetModel* model) {
     zero_grads_block(&model->dec_up2);
     zero_grads_block(&model->dec_conv2);
     zero_grads_block(&model->final_conv);
+}
+
+static void clip_block_gradients(Block* b, float clip_val) {
+    for (int i = 0; i < b->num_layers; ++i) {
+        Layer* l = &b->layers[i];
+        if (l->grad_weights) {
+            int sz = get_tensor_size(l->grad_weights);
+            for (int j = 0; j < sz; ++j) {
+                if (l->grad_weights->values[j] > clip_val) l->grad_weights->values[j] = clip_val;
+                if (l->grad_weights->values[j] < -clip_val) l->grad_weights->values[j] = -clip_val;
+            }
+        }
+        if (l->grad_biases) {
+            int sz = get_tensor_size(l->grad_biases);
+            for (int j = 0; j < sz; ++j) {
+                if (l->grad_biases->values[j] > clip_val) l->grad_biases->values[j] = clip_val;
+                if (l->grad_biases->values[j] < -clip_val) l->grad_biases->values[j] = -clip_val;
+            }
+        }
+    }
+}
+
+// 전체 모델에 대해 클리핑
+void clip_gradients(UNetModel* m, float clip_val) {
+    clip_block_gradients(&m->enc1, clip_val);
+    clip_block_gradients(&m->enc2, clip_val);
+    clip_block_gradients(&m->bottleneck, clip_val);
+    clip_block_gradients(&m->dec_up1, clip_val);
+    clip_block_gradients(&m->dec_conv1, clip_val);
+    clip_block_gradients(&m->dec_up2, clip_val);
+    clip_block_gradients(&m->dec_conv2, clip_val);
+    clip_block_gradients(&m->final_conv, clip_val);
 }

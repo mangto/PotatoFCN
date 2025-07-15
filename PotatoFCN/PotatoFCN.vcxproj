@@ -42,13 +42,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>Intel C++ Compiler 2025</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>Intel C++ Compiler 2025</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -104,7 +104,7 @@
       <ConformanceMode>true</ConformanceMode>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <AdditionalIncludeDirectories>C:\dev\OpenBLAS\include;D:\oneDNN-2.7.3\install\include</AdditionalIncludeDirectories>
-      <OpenMPSupport>false</OpenMPSupport>
+      <OpenMPSupport>true</OpenMPSupport>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -137,6 +137,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="cnn_unet.c" />
+    <ClCompile Include="conv2d_primitive.c" />
+    <ClCompile Include="conv_bwd_data_primitive.c" />
+    <ClCompile Include="conv_bwd_weights_primitive.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="math_utils.c" />
     <ClCompile Include="matrix.c">
@@ -147,6 +150,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="cnn_unet.h" />
+    <ClInclude Include="conv2d_primitive.h" />
+    <ClInclude Include="conv_bwd_data_primitive.h" />
+    <ClInclude Include="conv_bwd_weights_primitive.h" />
     <ClInclude Include="math_utils.h" />
     <ClInclude Include="matrix.h">
       <DeploymentContent>false</DeploymentContent>

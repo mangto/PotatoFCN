@@ -1,4 +1,4 @@
-#include "tensor.h"
+ï»¿#include "tensor.h"
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
@@ -8,6 +8,134 @@
 #include <omp.h>
 
 #include <cblas.h>
+#include <dnnl.h>
+
+const char* dnnl_status2str(dnnl_status_t s) {
+    switch (s) {
+    case dnnl_success:            return "dnnl_success";
+    case dnnl_out_of_memory:      return "dnnl_out_of_memory";
+    case dnnl_invalid_arguments:  return "dnnl_invalid_arguments";
+    case dnnl_unimplemented:      return "dnnl_unimplemented";
+    case dnnl_runtime_error:      return "dnnl_runtime_error";
+    case dnnl_not_required:       return "dnnl_not_required";
+    default:                      return "unknown dnnl_status_t";
+    }
+}
+
+#define CHECK(stmt)                                                 \
+    do {                                                            \
+        dnnl_status_t _s = (stmt);                                  \
+        if (_s != dnnl_success) {                                   \
+            fprintf(stderr,                                         \
+                "[%s:%d] %s -> %s (%d)\n",                         \
+                __FILE__, __LINE__, #stmt,                          \
+                dnnl_status2str(_s), (int)_s);                      \
+            exit(1);                                                \
+        }                                                           \
+    } while (0)
+
+// Global oneDNN engine and stream
+static dnnl_engine_t eng = NULL;
+static dnnl_stream_t strm = NULL;
+
+// Initialize engine & stream once
+static void init_engine() {
+    if (!eng) {
+        CHECK(dnnl_engine_create(&eng, dnnl_cpu, 0));
+    }
+    if (!strm) {
+        CHECK(dnnl_stream_create(&strm, eng, dnnl_stream_default_flags));
+    }
+}
+
+// --- 2D Convolution Forward (NCHW, OIHW weights, NHWC bias) ---
+Tensor* tensor_conv2d(
+    const Tensor* input,      // [N, C, H, W]
+    const Tensor* weights,    // [F, C, K, K]
+    const Tensor* biases,     // [F]
+    int stride,
+    int padding,
+    Tensor** col_buffer_ptr)  // unused
+{
+    init_engine();
+
+    // Extract dims
+    int N = input->shape[0], C = input->shape[1];
+    int H = input->shape[2], W = input->shape[3];
+    int F = weights->shape[0], K = weights->shape[2];
+    int H_out = (H - K + 2 * padding) / stride + 1;
+    int W_out = (W - K + 2 * padding) / stride + 1;
+
+    // Allocate output tensor [N, F, H_out, W_out]
+    Tensor* output = create_tensor((int[]) { N, F, H_out, W_out }, 4);
+
+    // Prepare oneDNN dimension arrays
+    dnnl_dims_t src_dims = { N, C, H,    W };
+    dnnl_dims_t weight_dims = { F, C, K,    K };
+    dnnl_dims_t bias_dims = { F };
+    dnnl_dims_t dst_dims = { N, F, H_out, W_out };
+    dnnl_dims_t strides_dims = { stride, stride };
+    dnnl_dims_t pad_dims = { padding, padding };
+
+    // Create memory descriptors
+    dnnl_memory_desc_t src_md, weight_md, bias_md, dst_md;
+    CHECK(dnnl_memory_desc_init_by_tag(
+        &src_md, 4, src_dims, dnnl_f32, dnnl_nchw));
+    CHECK(dnnl_memory_desc_init_by_tag(
+        &weight_md, 4, weight_dims, dnnl_f32, dnnl_oihw));
+    CHECK(dnnl_memory_desc_init_by_tag(
+        &bias_md, 1, bias_dims, dnnl_f32, dnnl_x));
+    CHECK(dnnl_memory_desc_init_by_tag(
+        &dst_md, 4, dst_dims, dnnl_f32, dnnl_nchw));
+
+    // Create convolution descriptor
+    dnnl_convolution_desc_t conv_desc;
+    CHECK(dnnl_convolution_forward_desc_init(
+        &conv_desc,
+        dnnl_forward_inference,
+        dnnl_convolution_direct,
+        &src_md, &weight_md, &bias_md, &dst_md,
+        strides_dims, pad_dims, pad_dims));
+
+    // Primitive descriptor + primitive
+    dnnl_primitive_desc_t conv_pd;
+    CHECK(dnnl_primitive_desc_create(
+        &conv_pd, &conv_desc, NULL, eng, NULL));
+    dnnl_primitive_t conv_prim;
+    CHECK(dnnl_primitive_create(&conv_prim, conv_pd));
+
+    // Create memory objects
+    dnnl_memory_t src_mem, weight_mem, bias_mem, dst_mem;
+    CHECK(dnnl_memory_create(
+        &src_mem, &src_md, eng, (void*)input->values));
+    CHECK(dnnl_memory_create(
+        &weight_mem, &weight_md, eng, (void*)weights->values));
+    CHECK(dnnl_memory_create(
+        &bias_mem, &bias_md, eng, (void*)biases->values));
+    CHECK(dnnl_memory_create(
+        &dst_mem, &dst_md, eng, output->values));
+
+    // Execute convolution
+    dnnl_exec_arg_t args[] = {
+        {DNNL_ARG_SRC,       src_mem},
+        {DNNL_ARG_WEIGHTS,   weight_mem},
+        {DNNL_ARG_BIAS,      bias_mem},
+        {DNNL_ARG_DST,       dst_mem},
+    };
+    CHECK(dnnl_primitive_execute(conv_prim, strm, 4, args));
+    CHECK(dnnl_stream_wait(strm));
+
+    // Cleanup
+    dnnl_primitive_destroy(conv_prim);
+    dnnl_primitive_desc_destroy(conv_pd);
+    dnnl_memory_destroy(src_mem);
+    dnnl_memory_destroy(weight_mem);
+    dnnl_memory_destroy(bias_mem);
+    dnnl_memory_destroy(dst_mem);
+
+    return output;
+}
+
 
 // --- Tensor creation and memory management ---
 Tensor* create_tensor(const int* shape, int dims) {
@@ -160,15 +288,15 @@ Tensor* tensor_dot(const Tensor* t1, const Tensor* t2) {
     Tensor* result = create_tensor((int[]) { m, n }, 2);
 
     // cblas_sgemm(Order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)
-    cblas_sgemm(CblasRowMajor, // Çà ¿ì¼± ¼ø¼­
-        CblasNoTrans,  // A´Â Transpose ¾ÈÇÔ
-        CblasNoTrans,  // Bµµ Transpose ¾ÈÇÔ
+    cblas_sgemm(CblasRowMajor, // í–‰ ìš°ì„  ìˆœì„œ
+        CblasNoTrans,  // AëŠ” Transpose ì•ˆí•¨
+        CblasNoTrans,  // Bë„ Transpose ì•ˆí•¨
         m, n, k,       // M, N, K
-        1.0f,          // alpha (°ö¼À °è¼ö)
-        t1->values, k, // A Çà·Ä, lda (AÀÇ ¿­ °³¼ö)
-        t2->values, n, // B Çà·Ä, ldb (BÀÇ ¿­ °³¼ö)
-        0.0f,          // beta (µ¡¼À °è¼ö, 0ÀÌ¸é µ¤¾î¾²±â)
-        result->values, n); // C Çà·Ä, ldc (CÀÇ ¿­ °³¼ö)
+        1.0f,          // alpha (ê³±ì…ˆ ê³„ìˆ˜)
+        t1->values, k, // A í–‰ë ¬, lda (Aì˜ ì—´ ê°œìˆ˜)
+        t2->values, n, // B í–‰ë ¬, ldb (Bì˜ ì—´ ê°œìˆ˜)
+        0.0f,          // beta (ë§ì…ˆ ê³„ìˆ˜, 0ì´ë©´ ë®ì–´ì“°ê¸°)
+        result->values, n); // C í–‰ë ¬, ldc (Cì˜ ì—´ ê°œìˆ˜)
 
     return result;
 }
@@ -231,8 +359,9 @@ static void im2col(const float* data_im, int channels, int height, int width,
     int height_col = (height + 2 * pad_h - kernel_h) / stride_h + 1;
     int width_col = (width + 2 * pad_w - kernel_w) / stride_w + 1;
     int channels_col = channels * kernel_h * kernel_w;
+    int c;
 #pragma omp parallel for
-    for (int c = 0; c < channels_col; ++c) {
+    for (c = 0; c < channels_col; ++c) {
         int w_offset = c % kernel_w;
         int h_offset = (c / kernel_w) % kernel_h;
         int c_im = c / (kernel_h * kernel_w);
@@ -273,75 +402,6 @@ static void col2im(const float* data_col, int channels, int height, int width,
 }
 
 
-
-Tensor* tensor_conv2d(const Tensor* input, const Tensor* weights, const Tensor* biases,
-    int stride, int padding, Tensor** col_buffer_ptr) {
-
-    assert(input->dims == 4 && weights->dims == 4 && biases->dims == 1);
-    assert(input->shape[1] == weights->shape[1]);
-
-    int N = input->shape[0], C = input->shape[1], H = input->shape[2], W = input->shape[3];
-    int F = weights->shape[0], K = weights->shape[2];
-    int H_out = (H - K + 2 * padding) / stride + 1;
-    int W_out = (W - K + 2 * padding) / stride + 1;
-
-    int M_gemm = F;
-    int K_gemm = C * K * K;
-    int N_gemm = H_out * W_out;
-
-    long required_size = (long)K_gemm * N_gemm;
-    if (*col_buffer_ptr == NULL || get_tensor_size(*col_buffer_ptr) < required_size) {
-        if (*col_buffer_ptr) free_tensor(*col_buffer_ptr);
-        *col_buffer_ptr = create_tensor((int[]) { required_size }, 1);
-    }
-    Tensor* col_buffer = *col_buffer_ptr;
-
-    Tensor weights_reshaped = *weights;
-    weights_reshaped.dims = 2;
-    int new_shape[] = { M_gemm, K_gemm };
-    weights_reshaped.shape = new_shape;
-
-    Tensor* output = create_tensor((int[]) { N, F, H_out, W_out }, 4);
-
-    for (int i = 0; i < N; ++i) {
-        const float* input_image = input->values + i * C * H * W;
-        im2col(input_image, C, H, W, K, K, stride, stride, padding, padding, col_buffer->values);
-
-        Tensor col_buffer_reshaped;
-        col_buffer_reshaped.dims = 2;
-        int col_shape[] = { K_gemm, N_gemm };
-        col_buffer_reshaped.shape = col_shape;
-        col_buffer_reshaped.values = col_buffer->values;
-
-        Tensor* output_gemm = tensor_dot(&weights_reshaped, &col_buffer_reshaped);
-        assert(output_gemm->shape[0] == F && output_gemm->shape[1] == N_gemm);
-
-        float* output_ptr = output->values + i * F * N_gemm;
-        const float* gemm_ptr = output_gemm->values;
-
-#pragma omp parallel for
-        for (int f = 0; f < F; ++f) {
-            const float bias_val = biases->values[f];
-            float* out_channel_ptr = output_ptr + f * N_gemm;
-            const float* gemm_channel_ptr = gemm_ptr + f * N_gemm;
-            int j = 0;
-            __m256 ymm_bias = _mm256_set1_ps(bias_val);
-            for (; j <= N_gemm - 8; j += 8) {
-                __m256 ymm_gemm = _mm256_loadu_ps(gemm_channel_ptr + j);
-                __m256 ymm_res = _mm256_add_ps(ymm_gemm, ymm_bias);
-                _mm256_storeu_ps(out_channel_ptr + j, ymm_res);
-            }
-            for (; j < N_gemm; ++j) {
-                out_channel_ptr[j] = gemm_channel_ptr[j] + bias_val;
-            }
-        }
-
-        free_tensor(output_gemm);
-    }
-
-    return output;
-}
-
 Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** max_indices_tensor) {
     assert(input->dims == 4);
     int N = input->shape[0], C = input->shape[1], H = input->shape[2], W = input->shape[3];
@@ -353,10 +413,11 @@ Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** 
         *max_indices_tensor = create_tensor((int[]) { N, C, H_out, W_out }, 4);
     }
 
-    // ÃÖÀûÈ­ ¼³¸í: N, C, H_out, W_out 4°³ ·çÇÁ¸¦ º´·ÄÈ­ÇÕ´Ï´Ù.
-    // ÀÛ¾÷ ºÎÇÏ°¡ ±ÕÀÏÇÒ °ÍÀ¸·Î ¿¹»óµÇ¹Ç·Î schedule(static)À» »ç¿ëÇÕ´Ï´Ù.
+    // ìµœì í™” ì„¤ëª…: N, C, H_out, W_out 4ê°œ ë£¨í”„ë¥¼ ë³‘ë ¬í™”í•©ë‹ˆë‹¤.
+    // ì‘ì—… ë¶€í•˜ê°€ ê· ì¼í•  ê²ƒìœ¼ë¡œ ì˜ˆìƒë˜ë¯€ë¡œ schedule(static)ì„ ì‚¬ìš©í•©ë‹ˆë‹¤.
+    int n;
 #pragma omp parallel for collapse(4) schedule(static)
-    for (int n = 0; n < N; n++) {
+    for (n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             for (int ho = 0; ho < H_out; ho++) {
                 for (int wo = 0; wo < W_out; wo++) {
@@ -387,14 +448,15 @@ Tensor* tensor_maxpool(const Tensor* input, int pool_size, int stride, Tensor** 
 
 // --- CNN backward pass ---
 Tensor* tensor_maxpool_backward(const Tensor* grad_output, const Tensor* original_input, const Tensor* max_indices) {
-    Tensor* grad_input = create_tensor(original_input->shape, original_input->dims); // 0À¸·Î ÃÊ±âÈ­
+    Tensor* grad_input = create_tensor(original_input->shape, original_input->dims); // 0ìœ¼ë¡œ ì´ˆê¸°í™”
     int N = grad_output->shape[0], C = grad_output->shape[1];
     int H_out = grad_output->shape[2], W_out = grad_output->shape[3];
     int H_in = original_input->shape[2], W_in = original_input->shape[3];
 
-    // ÃÖÀûÈ­ ¼³¸í: 4°³ÀÇ ¿ÜºÎ ·çÇÁ¸¦ ÇÕÃÄ¼­ º´·ÄÈ­ÇÕ´Ï´Ù.
+    // ìµœì í™” ì„¤ëª…: 4ê°œì˜ ì™¸ë¶€ ë£¨í”„ë¥¼ í•©ì³ì„œ ë³‘ë ¬í™”í•©ë‹ˆë‹¤.
+    int n;
 #pragma omp parallel for collapse(4) schedule(static)
-    for (int n = 0; n < N; n++) {
+    for (n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             for (int ho = 0; ho < H_out; ho++) {
                 for (int wo = 0; wo < W_out; wo++) {
@@ -402,9 +464,9 @@ Tensor* tensor_maxpool_backward(const Tensor* grad_output, const Tensor* origina
                     int max_idx_flat = (int)max_indices->values[n * C * H_out * W_out + c * H_out * W_out + ho * W_out + wo];
                     int grad_input_idx = n * C * H_in * W_in + c * H_in * W_in + max_idx_flat;
 
-                    // ÁÖÀÇ: ÀÌ ¿¬»êÀº ¿øÀÚÀû(atomic)ÀÌ¾î¾ß ÇÒ ¼ö ÀÖÀ¸³ª, max-poolingÀÇ Æ¯¼º»ó
-                    // ¼­·Î ´Ù¸¥ (ho, wo)°¡ °°Àº grad_input_idx¿¡ Á¢±ÙÇÒ È®·üÀÌ °ÅÀÇ ¾ø¾î ÀÏ¹İÀûÀ¸·Î ¾ÈÀüÇÕ´Ï´Ù.
-                    // ¸¸¾àÀÇ °æ¿ì¸¦ ´ëºñÇØ atomicÀ» »ç¿ëÇÒ ¼ö ÀÖ½À´Ï´Ù.
+                    // ì£¼ì˜: ì´ ì—°ì‚°ì€ ì›ìì (atomic)ì´ì–´ì•¼ í•  ìˆ˜ ìˆìœ¼ë‚˜, max-poolingì˜ íŠ¹ì„±ìƒ
+                    // ì„œë¡œ ë‹¤ë¥¸ (ho, wo)ê°€ ê°™ì€ grad_input_idxì— ì ‘ê·¼í•  í™•ë¥ ì´ ê±°ì˜ ì—†ì–´ ì¼ë°˜ì ìœ¼ë¡œ ì•ˆì „í•©ë‹ˆë‹¤.
+                    // ë§Œì•½ì˜ ê²½ìš°ë¥¼ ëŒ€ë¹„í•´ atomicì„ ì‚¬ìš©í•  ìˆ˜ ìˆìŠµë‹ˆë‹¤.
 #pragma omp atomic
                     grad_input->values[grad_input_idx] += grad;
                 }
@@ -419,12 +481,13 @@ Tensor* tensor_conv_grad_bias(const Tensor* grad_output) {
     Tensor* grad_biases = create_tensor((int[]) { F }, 1);
     int N = grad_output->shape[0], H_out = grad_output->shape[2], W_out = grad_output->shape[3];
 
-    // ÃÖÀûÈ­ ¼³¸í: °¢ ÇÊÅÍ(f)¿¡ ´ëÇÑ °è»êÀº µ¶¸³ÀûÀÌ¹Ç·Î ¿ÜºÎ ·çÇÁ¸¦ º´·ÄÈ­ÇÕ´Ï´Ù.
-    // ÀÌ°ÍÀÌ ÀÌ ÇÔ¼ö ±¸Á¶¿¡ °¡Àå ÀûÇÕÇÑ º´·ÄÈ­ ¹æ½ÄÀÔ´Ï´Ù.
+    // ìµœì í™” ì„¤ëª…: ê° í•„í„°(f)ì— ëŒ€í•œ ê³„ì‚°ì€ ë…ë¦½ì ì´ë¯€ë¡œ ì™¸ë¶€ ë£¨í”„ë¥¼ ë³‘ë ¬í™”í•©ë‹ˆë‹¤.
+    // ì´ê²ƒì´ ì´ í•¨ìˆ˜ êµ¬ì¡°ì— ê°€ì¥ ì í•©í•œ ë³‘ë ¬í™” ë°©ì‹ì…ë‹ˆë‹¤.
+    int f;
 #pragma omp parallel for schedule(static)
-    for (int f = 0; f < F; f++) {
+    for (f = 0; f < F; f++) {
         float sum = 0.0f;
-        // ÀÌ ³»ºÎ ·çÇÁµéÀº °¢ ½º·¹µå°¡ µ¶¸³ÀûÀ¸·Î ½ÇÇàÇÕ´Ï´Ù.
+        // ì´ ë‚´ë¶€ ë£¨í”„ë“¤ì€ ê° ìŠ¤ë ˆë“œê°€ ë…ë¦½ì ìœ¼ë¡œ ì‹¤í–‰í•©ë‹ˆë‹¤.
         for (int n = 0; n < N; n++) {
             for (int h = 0; h < H_out; h++) {
                 for (int w = 0; w < W_out; w++) {
@@ -487,51 +550,87 @@ Tensor* tensor_conv_grad_weights(const Tensor* input, const Tensor* grad_output,
     }
     return grad_weights_new;
 }
+Tensor* tensor_conv_grad_input(
+    const Tensor* grad_output,  // [N, F, H_out, W_out]
+    const Tensor* weights,      // [F, C, K, K]
+    int stride,
+    int padding,
+    Tensor* col_buffer)
+{
+    init_engine();
 
-Tensor* tensor_conv_grad_input(const Tensor* grad_output, const Tensor* weights,
-    int stride, int padding, Tensor* col_buffer) {
+    // 1) Dimensions
     int N = grad_output->shape[0];
     int F = grad_output->shape[1];
     int H_out = grad_output->shape[2];
     int W_out = grad_output->shape[3];
-
     int C = weights->shape[1];
     int K = weights->shape[2];
 
+    // Calculate input spatial dims
     int H = (H_out - 1) * stride + K - 2 * padding;
     int W = (W_out - 1) * stride + K - 2 * padding;
 
+    // 2) Allocate grad_input tensor [N, C, H, W]
     Tensor* grad_input = create_tensor((int[]) { N, C, H, W }, 4);
 
-    int M_gemm_gi = C * K * K;
-    int N_gemm_gi = H_out * W_out;
-    int K_gemm_gi = F;
+    // 3) Prepare oneDNN dims arrays
+    dnnl_dims_t diff_src_dims = { N, C, H,    W };
+    dnnl_dims_t weights_dims = { F, C, K,    K };
+    dnnl_dims_t diff_dst_dims = { N, F, H_out, W_out };
+    dnnl_dims_t strides = { stride, stride };
+    dnnl_dims_t paddings_l = { padding, padding };
+    dnnl_dims_t paddings_r = { padding, padding };
 
-    Tensor weights_T_proto = *weights;
-    weights_T_proto.dims = 2;
-    int w_shape[] = { K_gemm_gi, M_gemm_gi };
-    weights_T_proto.shape = w_shape;
-    Tensor* WT = tensor_transpose(&weights_T_proto);
+    // 4) Create memory descriptors (explicit layouts)
+    dnnl_memory_desc_t diff_src_md, weights_md, diff_dst_md;
+    CHECK(dnnl_memory_desc_init_by_tag(&diff_src_md, 4, diff_src_dims, dnnl_f32, dnnl_nchw));
+    CHECK(dnnl_memory_desc_init_by_tag(&weights_md, 4, weights_dims, dnnl_f32, dnnl_oihw));
+    CHECK(dnnl_memory_desc_init_by_tag(&diff_dst_md, 4, diff_dst_dims, dnnl_f32, dnnl_nchw));
 
-    for (int i = 0; i < N; ++i) {
-        const float* grad_output_image = grad_output->values + i * F * H_out * W_out;
-        Tensor grad_output_reshaped;
-        grad_output_reshaped.dims = 2;
-        int grad_shape[] = { K_gemm_gi, N_gemm_gi };
-        grad_output_reshaped.shape = grad_shape;
-        grad_output_reshaped.values = (float*)grad_output_image;
+    // 5) Build backwardâ€data convolution descriptor (9 args)
+    dnnl_convolution_desc_t bwd_data_desc;
+    CHECK(dnnl_convolution_backward_data_desc_init(
+        &bwd_data_desc,
+        dnnl_convolution_direct,   // choose direct algorithm
+        &diff_src_md,              // diff_src (we'll produce this)
+        &weights_md,               // weights
+        &diff_dst_md,              // diff_dst (grad_output)
+        strides,                   // strides
+        paddings_l,                // padding_l
+        paddings_r                 // padding_r
+    ));
 
-        Tensor* dX_col = tensor_dot(WT, &grad_output_reshaped);
+    // 6) Create primitive descriptor + primitive
+    dnnl_primitive_desc_t bwd_data_pd;
+    CHECK(dnnl_primitive_desc_create(&bwd_data_pd, &bwd_data_desc, NULL, eng, NULL));
+    dnnl_primitive_t bwd_data_prim;
+    CHECK(dnnl_primitive_create(&bwd_data_prim, bwd_data_pd));
 
-        float* grad_input_image = grad_input->values + i * C * H * W;
-        col2im(dX_col->values, C, H, W, K, K, stride, stride, padding, padding, grad_input_image);
-        free_tensor(dX_col);
-    }
+    // 7) Create memory objects
+    dnnl_memory_t diff_dst_mem, weights_mem, diff_src_mem;
+    CHECK(dnnl_memory_create(&diff_dst_mem, &diff_dst_md, eng, (void*)grad_output->values));
+    CHECK(dnnl_memory_create(&weights_mem, &weights_md, eng, (void*)weights->values));
+    CHECK(dnnl_memory_create(&diff_src_mem, &diff_src_md, eng, grad_input->values));
 
-    free_tensor(WT);
+    // 8) Execute backwardâ€data
+    dnnl_exec_arg_t args[] = {
+        { DNNL_ARG_DIFF_DST, diff_dst_mem },
+        { DNNL_ARG_WEIGHTS,  weights_mem },
+        { DNNL_ARG_DIFF_SRC, diff_src_mem }
+    };
+    CHECK(dnnl_primitive_execute(bwd_data_prim, strm, 3, args));
+    CHECK(dnnl_stream_wait(strm));
+
+    // 9) Cleanup
+    dnnl_primitive_destroy(bwd_data_prim);
+    dnnl_primitive_desc_destroy(bwd_data_pd);
+    dnnl_memory_destroy(diff_dst_mem);
+    dnnl_memory_destroy(weights_mem);
+    dnnl_memory_destroy(diff_src_mem);
+
     return grad_input;
 }
-
 
 
 Tensor* tensor_concatenate(Tensor* t1, Tensor* t2, int axis) {
