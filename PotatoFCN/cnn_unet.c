@@ -1,5 +1,7 @@
 #include "cnn_unet.h"
 #include "math_utils.h"
+#include "tensor.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
