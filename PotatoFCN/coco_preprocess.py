@@ -14,7 +14,7 @@ OUTPUT_DIR = './preprocessed_data'
 # 모델에 입력할 이미지 크기
 IMG_SIZE = (128, 128)
 # 처리할 이미지 개수 (전체는 약 11만장으로 매우 오래 걸리므로, 테스트용으로 줄여서 사용)
-NUM_SAMPLES_TO_PROCESS = 1000
+NUM_SAMPLES_TO_PROCESS = 5000
 
 # --- 전처리 시작 ---
 ann_file = os.path.join(DATA_DIR, 'annotations', f'instances_{DATA_TYPE}.json')

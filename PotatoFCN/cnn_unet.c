@@ -1,4 +1,4 @@
-#include "cnn_unet.h"
+Ôªø#include "cnn_unet.h"
 #include "math_utils.h"
 #include "tensor.h"
 
@@ -6,6 +6,86 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+
+static int adam_t = 1;
+
+// ÌïòÏù¥ÌçºÌååÎùºÎØ∏ÌÑ∞: Œ≤‚ÇÅ, Œ≤‚ÇÇ, Œµ Îäî Ìò∏Ï∂ú Ïãú ÎÑòÍ≤®Ï£ºÏÑ∏Ïöî.
+void unet_update_adam(
+    UNetModel* model,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps
+) {
+    // Œ≤‚ÇÅ·µó, Œ≤‚ÇÇ·µó ÎØ∏Î¶¨ Í≥ÑÏÇ∞
+    float bias_correction1 = 1.0f - powf(beta1, adam_t);
+    float bias_correction2 = 1.0f - powf(beta2, adam_t);
+
+#define UPDATE_LAYER(L) \
+      do { \
+        /* weight */ \
+        int Wn = get_tensor_size((L)->weights); \
+        for (int i = 0; i < Wn; ++i) { \
+          float g = (L)->grad_weights->values[i]; \
+          /* 1st, 2nd moment ÏóÖÎç∞Ïù¥Ìä∏ */ \
+          (L)->m_w->values[i] = beta1 * (L)->m_w->values[i] + (1 - beta1) * g; \
+          (L)->v_w->values[i] = beta2 * (L)->v_w->values[i] + (1 - beta2) * (g * g); \
+          /* Ìé∏Ìñ• Î≥¥Ï†ïÎêú Î™®Î©òÌä∏ */ \
+          float m_hat = (L)->m_w->values[i] / bias_correction1; \
+          float v_hat = (L)->v_w->values[i] / bias_correction2; \
+          /* Îß§Í∞úÎ≥ÄÏàò ÏóÖÎç∞Ïù¥Ìä∏ */ \
+          (L)->weights->values[i] -= lr * m_hat / (sqrtf(v_hat) + eps); \
+        } \
+        /* bias */ \
+        int Bn = get_tensor_size((L)->biases); \
+        for (int i = 0; i < Bn; ++i) { \
+          float g = (L)->grad_biases->values[i]; \
+          (L)->m_b->values[i] = beta1 * (L)->m_b->values[i] + (1 - beta1) * g; \
+          (L)->v_b->values[i] = beta2 * (L)->v_b->values[i] + (1 - beta2) * (g * g); \
+          float m_hat = (L)->m_b->values[i] / bias_correction1; \
+          float v_hat = (L)->v_b->values[i] / bias_correction2; \
+          (L)->biases->values[i]  -= lr * m_hat / (sqrtf(v_hat) + eps); \
+        } \
+      } while (0)
+
+    // Í∞Å Î∏îÎ°ù, Í∞Å Î†àÏù¥Ïñ¥Ïóê ÎåÄÌï¥
+    for (int i = 0; i < model->enc1.num_layers; ++i) {
+        Layer* L = &model->enc1.layers[i];
+        if (L->weights) UPDATE_LAYER(L);
+    }
+    for (int i = 0; i < model->enc2.num_layers; ++i) {
+        Layer* L = &model->enc2.layers[i];
+        if (L->weights) UPDATE_LAYER(L);
+    }
+    for (int i = 0; i < model->bottleneck.num_layers; ++i) {
+        Layer* L = &model->bottleneck.layers[i];
+        if (L->weights) UPDATE_LAYER(L);
+    }
+    for (int i = 0; i < model->dec_up1.num_layers; ++i) {
+        Layer* L = &model->dec_up1.layers[i];
+        if (L->weights) UPDATE_LAYER(L);
+    }
+    for (int i = 0; i < model->dec_conv1.num_layers; ++i) {
+        Layer* L = &model->dec_conv1.layers[i];
+        if (L->weights) UPDATE_LAYER(L);
+    }
+    for (int i = 0; i < model->dec_up2.num_layers; ++i) {
+        Layer* L = &model->dec_up2.layers[i];
+        if (L->weights) UPDATE_LAYER(L);
+    }
+    for (int i = 0; i < model->dec_conv2.num_layers; ++i) {
+        Layer* L = &model->dec_conv2.layers[i];
+        if (L->weights) UPDATE_LAYER(L);
+    }
+    for (int i = 0; i < model->final_conv.num_layers; ++i) {
+        Layer* L = &model->final_conv.layers[i];
+        if (L->weights) UPDATE_LAYER(L);
+    }
+
+#undef UPDATE_LAYER
+
+    adam_t++;
+}
 
 static void init_weights(Tensor* t) {
     int fan_in = (t->dims > 1) ? t->shape[1] * t->shape[2] * t->shape[3] : t->shape[0];
@@ -106,7 +186,7 @@ void unet_free_intermediates(UNetIntermediates* im) {
     }
 }
 
-// --- ∏µ® ±∏¡∂ ∫ÙµÂ «‘ºˆ ---
+// --- Î™®Îç∏ Íµ¨Ï°∞ ÎπåÎìú Ìï®Ïàò ---
 void unet_build(UNetModel* model) {
     int in_channels = 1;
 
@@ -155,7 +235,7 @@ void unet_build(UNetModel* model) {
     block_init(&model->final_conv);
     add_conv(&model->final_conv, 16, 1, 1, 1, 0); // 1x1 Convolution
 
-    // ∏µÁ Block ø° ¥Î«ÿ backward primitives πËø≠∏∏ «“¥Á(calloc √ ±‚»≠)
+    // Allocate backward primitives and Adam moments, zero-init
     Block* blocks[] = {
         &model->enc1, &model->enc2, &model->bottleneck,
         &model->dec_up1, &model->dec_conv1,
@@ -166,13 +246,26 @@ void unet_build(UNetModel* model) {
     for (int bi = 0; bi < num_blocks; ++bi) {
         Block* b = blocks[bi];
         int L = b->num_layers;
-        b->conv_w_prims = malloc(L * sizeof(*b->conv_w_prims));
-        b->conv_d_prims = malloc(L * sizeof(*b->conv_d_prims));
-        b->deconv_w_prims = malloc(L * sizeof(*b->deconv_w_prims));
-        b->deconv_d_prims = malloc(L * sizeof(*b->deconv_d_prims));
+        b->conv_w_prims = calloc(L, sizeof(*b->conv_w_prims));
+        b->conv_d_prims = calloc(L, sizeof(*b->conv_d_prims));
+        b->deconv_w_prims = calloc(L, sizeof(*b->deconv_w_prims));
+        b->deconv_d_prims = calloc(L, sizeof(*b->deconv_d_prims));
         b->prim_inited = calloc(L, sizeof(*b->prim_inited));
+        // Initialize Adam moments for each layer
+        for (int i = 0; i < L; ++i) {
+            Layer* l = &b->layers[i];
+            if (l->weights) {
+                l->m_w = create_tensor(l->weights->shape, l->weights->dims);
+                l->v_w = create_tensor(l->weights->shape, l->weights->dims);
+            }
+            if (l->biases) {
+                l->m_b = create_tensor(l->biases->shape, l->biases->dims);
+                l->v_b = create_tensor(l->biases->shape, l->biases->dims);
+            }
+        }
     }
 }
+
 
 
 static Tensor* forward_block(Block* b, Tensor* input, Tensor** col_workspace_ptr) {
@@ -214,10 +307,10 @@ static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr
         Layer* l = &b->layers[i];
         Tensor* next_grad = NULL;
 
-        // ¶°¶°¶° 1) LAZY?INIT PRIMITIVES FOR THIS LAYER ¶°¶°¶°
+        // ‚îÄ‚îÄ‚îÄ 1) LAZY‚ÄëINIT PRIMITIVES FOR THIS LAYER ‚îÄ‚îÄ‚îÄ
         if (!b->prim_inited[i] &&
             (l->type == LAYER_CONV2D || l->type == LAYER_TRANSPOSED_CONV2D)) {
-            // l->input is now non?NULL because forward has been called
+            // l->input is now non‚ÄëNULL because forward has been called
             int N = l->input->shape[0];
             int C = l->input->shape[1];
             int H = l->input->shape[2];
@@ -234,7 +327,7 @@ static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr
                     &b->conv_d_prims[i], N, C, H, W, F, K, s, p);
             }
             else {
-                // transposed?conv backward uses same init signature but no padding
+                // transposed‚Äêconv backward uses same init signature but no padding
                 conv_bwd_weights_primitive_init(
                     &b->deconv_w_prims[i], N, C, H, W, F, K, s, p);
                 conv_bwd_data_primitive_init(
@@ -243,7 +336,7 @@ static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr
             b->prim_inited[i] = true;
         }
 
-        // ¶°¶°¶° 2) ACTUAL BACKPROP ¶°¶°¶°
+        // ‚îÄ‚îÄ‚îÄ 2) ACTUAL BACKPROP ‚îÄ‚îÄ‚îÄ
         switch (l->type) {
         case LAYER_RELU: {
             Tensor* deriv = copy_tensor(l->input);
@@ -253,7 +346,7 @@ static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr
             break;
         }
         case LAYER_CONV2D: {
-            // 2a) weight?grad
+            // 2a) weight‚Äëgrad
             Tensor* gw = conv_bwd_weights_primitive_execute(
                 &b->conv_w_prims[i],
                 l->input,
@@ -263,13 +356,13 @@ static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr
                 l->grad_weights->values[j] += gw->values[j];
             free_tensor(gw);
 
-            // 2b) bias?grad
+            // 2b) bias‚Äëgrad
             Tensor* gb = tensor_conv_grad_bias(current_grad);
             for (int j = 0; j < get_tensor_size(gb); ++j)
                 l->grad_biases->values[j] += gb->values[j];
             free_tensor(gb);
 
-            // 2c) input?grad
+            // 2c) input‚Äëgrad
             next_grad = conv_bwd_data_primitive_execute(
                 &b->conv_d_prims[i],
                 current_grad,
@@ -485,7 +578,7 @@ static void clip_block_gradients(Block* b, float clip_val) {
     }
 }
 
-// ¿¸√º ∏µ®ø° ¥Î«ÿ ≈¨∏Æ«Œ
+// Ï†ÑÏ≤¥ Î™®Îç∏Ïóê ÎåÄÌï¥ ÌÅ¥Î¶¨Ìïë
 void clip_gradients(UNetModel* m, float clip_val) {
     clip_block_gradients(&m->enc1, clip_val);
     clip_block_gradients(&m->enc2, clip_val);

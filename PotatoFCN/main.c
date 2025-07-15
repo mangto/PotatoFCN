@@ -10,6 +10,7 @@
 #include <time.h>
 #include <string.h>
 #include <omp.h>
+#include <math.h>
 #include <sys/stat.h>  // for stat()
 
 // ------------------------------------------------------------
@@ -133,6 +134,19 @@ void print_progress(int current, int total, float loss, int elapsed_sec) {
     fflush(stdout);
 }
 
+#define M_PI 3.14159265358979
+
+float get_lr(int step, int total_steps, float base_lr) {
+    const int warmup = 500;
+    if (step < warmup) {
+        // 선형 워밍업: 0 → base_lr
+        return base_lr * ((float)(step + 1) / (float)warmup);
+    }
+    // 워밍업 이후 코사인 디케이
+    float t = (float)(step - warmup) / (float)(total_steps - warmup);
+    return base_lr * 0.5f * (1.0f + cosf((float)M_PI * t));
+}
+
 //----------------------------------------------------------------------
 // Main
 //----------------------------------------------------------------------
@@ -150,7 +164,7 @@ int main() {
     unet_build(&model);
 
     // Try to load existing
-    const char* model_path = "unet_model.bin";
+    const char* model_path = "unet_model_adam.bin";
     if (file_exists(model_path)) {
         init_dnnl_engine();
         load_model(&model, model_path);
@@ -160,13 +174,17 @@ int main() {
     }
 
     // 3) Training settings
-    const int EPOCHS = 2;
+    const int EPOCHS = 5;
     const int BATCH_SIZE = 8;
-    const float LR = 0.0001f;
     Tensor* input_batch = create_tensor((int[]) { BATCH_SIZE, 1, IMG_H, IMG_W }, 4);
     Tensor* target_batch = create_tensor((int[]) { BATCH_SIZE, 1, IMG_H, IMG_W }, 4);
     int* indices = malloc(num_samples * sizeof(int));
     for (int i = 0; i < num_samples; ++i) indices[i] = i;
+
+    int steps_per_epoch = (num_samples + BATCH_SIZE - 1) / BATCH_SIZE;
+    int total_steps = EPOCHS * steps_per_epoch;
+    int global_step = 0;
+
 
     printf("\n--- Starting UNet Training (batch size = %d) ---\n", BATCH_SIZE);
     for (int e = 0; e < EPOCHS; ++e) {
@@ -201,6 +219,7 @@ int main() {
                 memset(&input_batch->values[this_batch * IMG_H * IMG_W], 0, rem * sizeof(float));
                 memset(&target_batch->values[this_batch * IMG_H * IMG_W], 0, rem * sizeof(float));
             }
+            float lr = get_lr(global_step, total_steps, 1e-4f);
 
             unet_zero_grads(&model);
             UNetIntermediates* im = unet_forward(&model, input_batch);
@@ -209,13 +228,14 @@ int main() {
             Tensor* grad = mse_loss_backward(im->pred_mask, target_batch);
             unet_backward(&model, im, grad);
             clip_gradients(&model, 1.0f);
-            unet_update_params(&model, LR);
+            unet_update_adam(&model, lr, 0.9f, 0.999f, 1e-8f);
             free_tensor(grad);
             unet_free_intermediates(im);
 
             // update progress bar
             int elapsed = (int)(time(NULL) - epoch_start);
-            print_progress(s + 1, steps, epoch_loss / (s + 1), elapsed);
+            float avg_loss = epoch_loss / (s + 1);
+            print_progress(s + 1, steps_per_epoch, avg_loss, elapsed);
         }
         printf("\nEpoch %d complete — Avg Loss: %.6f\n\n",
             e + 1, epoch_loss / steps);

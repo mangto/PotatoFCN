@@ -23,6 +23,8 @@ typedef struct {
     // Fields for storing the input and output of each layer
     Tensor *input;
     Tensor *output;
+    Tensor* m_w, * v_w;    // 1st, 2nd moment for weights
+    Tensor* m_b, * v_b;
 } Layer;
 typedef struct {
     Layer* layers;
@@ -49,6 +51,13 @@ typedef struct {
     Tensor *pred_mask;     // Final prediction result
 } UNetIntermediates;
 
+void unet_update_adam(
+    UNetModel* model,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps
+);
 
 // --- Function Prototypes ---
 void unet_build(UNetModel* model);
