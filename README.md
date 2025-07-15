@@ -12,31 +12,6 @@
 - **Checkpointing**: Save and load model parameters to/from `unet_model.bin`.
 - **Batch Training**: Configurable batch size with real-time progress bar showing loss, learning rate, and elapsed time.
 
-## 📁 Repository Structure
-
-```
-├── include/                  # Header files
-│   ├── cnn_unet.h            # U-Net model declarations
-│   ├── tensor.h              # Tensor struct and operations
-│   ├── utils.h               # Data loading and loss functions
-│   └── conv2d_primitive.h    # oneDNN wrappers
-├── src/                      # Source files
-│   ├── cnn_unet.c            # Model build, forward/backward, Adam update
-│   ├── tensor.c              # Tensor ops & oneDNN primitives
-│   ├── utils.c               # Data loader, MSE loss
-│   ├── conv2d_primitive.c    # oneDNN conv2d wrapper
-│   ├── conv_bwd_weights_primitive.c # oneDNN backward weights
-│   ├── conv_bwd_data_primitive.c    # oneDNN backward data
-│   └── main.c                # Training loop, batch logic, checkpoint I/O
-├── preprocessed_data/        # Input data binaries + info.txt
-│   ├── info.txt              # num_samples, height, width
-│   ├── coco_images.bin       # Flattened image floats
-│   └── coco_masks.bin        # Flattened mask floats
-├── unet_model.bin            # Serialized model weights (checkpoint)
-├── CMakeLists.txt            # Build configuration
-└── README.md                 # Project overview (this file)
-```
-
 ## ⚙️ Prerequisites
 
 - **oneDNN v2.8.0** (Intel MKL-DNN)
