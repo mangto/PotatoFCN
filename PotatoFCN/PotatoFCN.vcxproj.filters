@@ -24,9 +24,6 @@
     <ClCompile Include="math_utils.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="cnn.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="matrix.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -42,9 +39,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="math_utils.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="cnn.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="matrix.h">
