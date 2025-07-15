@@ -20,7 +20,7 @@ int get_tensor_size(const Tensor* t);
 void print_tensor(const Tensor* t, int print_values);
 Tensor* tensor_elemwise_mul(const Tensor* t1, const Tensor* t2);
 Tensor* tensor_concatenate(Tensor* t1, Tensor* t2, int axis);
-void tensor_concatenate_backward(Tensor** grad_t1, Tensor** grad_t2, Tensor* grad_output, int axis, int c1_channels);
+void tensor_concatenate_backward(Tensor* grad_t1, Tensor* grad_t2, Tensor* grad_output, int axis, int c1_channels);
 
 // --- im2col + BLAS 기반 연산 함수 ---
 Tensor* tensor_conv2d(const Tensor* input, const Tensor* weights, const Tensor* biases, int stride, int padding, Tensor** col_buffer_ptr);
