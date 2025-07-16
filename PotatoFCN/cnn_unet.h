@@ -11,7 +11,9 @@
 typedef enum {
     LAYER_CONV2D,
     LAYER_RELU,
-    LAYER_TRANSPOSED_CONV2D
+    LAYER_TRANSPOSED_CONV2D,
+    LAYER_SIGMOID,
+    LAYER_BATCHNORM
 } LayerType;
 
 typedef struct {
@@ -19,6 +21,16 @@ typedef struct {
     Tensor *weights, *biases;
     Tensor *grad_weights, *grad_biases;
     int stride, padding;
+
+    Tensor* batch_mean;
+    Tensor* batch_var;
+    Tensor* running_mean;
+    Tensor* running_var;
+
+    Tensor* gamma;
+    Tensor* beta;
+    Tensor* grad_gamma;
+    Tensor* grad_beta;
     
     // Fields for storing the input and output of each layer
     Tensor *input;

@@ -140,6 +140,7 @@
     <ClCompile Include="conv2d_primitive.c" />
     <ClCompile Include="conv_bwd_data_primitive.c" />
     <ClCompile Include="conv_bwd_weights_primitive.c" />
+    <ClCompile Include="main_infer.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="math_utils.c" />
     <ClCompile Include="matrix.c">
@@ -157,6 +158,8 @@
     <ClInclude Include="matrix.h">
       <DeploymentContent>false</DeploymentContent>
     </ClInclude>
+    <ClInclude Include="stb_image.h" />
+    <ClInclude Include="stb_image_write.h" />
     <ClInclude Include="tensor.h" />
     <ClInclude Include="utils.h" />
   </ItemGroup>

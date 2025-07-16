@@ -159,12 +159,27 @@ int main() {
     load_preprocessed_data("./preprocessed_data",
         &num_samples, &IMG_H, &IMG_W, &all_images, &all_masks);
 
+    long total_pixels = (long)num_samples * IMG_H * IMG_W;
+    double sum_pos = 0.0;
+    for (long i = 0; i < total_pixels; ++i) {
+        sum_pos += all_masks[i];
+    }
+    float p = sum_pos / total_pixels;
+    float bias_init = logf(p / (1.0f - p));
+    printf("Init bias (log odds) = %.4f (p=%.4f)\n", bias_init, p);
+
     // 2) Build model
     UNetModel model;
     unet_build(&model);
 
+    Layer* final_conv_layer = &model.final_conv.layers[0];
+    int out_c = final_conv_layer->biases->shape[0];
+    for (int j = 0; j < out_c; ++j) {
+        final_conv_layer->biases->values[j] = bias_init;
+    }
+
     // Try to load existing
-    const char* model_path = "unet_model_adam.bin";
+    const char* model_path = "unet_model_adam_batchnorm.bin";
     if (file_exists(model_path)) {
         init_dnnl_engine();
         load_model(&model, model_path);
@@ -223,11 +238,11 @@ int main() {
 
             unet_zero_grads(&model);
             UNetIntermediates* im = unet_forward(&model, input_batch);
-            float loss = mse_loss(im->pred_mask, target_batch);
+            float loss = focal_loss(im->pred_mask, target_batch, 2.0f);
+            Tensor* grad = focal_loss_backward(im->pred_mask, target_batch, 2.0f);
             epoch_loss += loss;
-            Tensor* grad = mse_loss_backward(im->pred_mask, target_batch);
             unet_backward(&model, im, grad);
-            clip_gradients(&model, 1.0f);
+            //clip_gradients(&model, 1.0f);
             unet_update_adam(&model, lr, 0.9f, 0.999f, 1e-8f);
             free_tensor(grad);
             unet_free_intermediates(im);

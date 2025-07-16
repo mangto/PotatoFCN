@@ -4,6 +4,23 @@
 #include <assert.h>
 #include <immintrin.h>
 
+
+void sigmoid_inplace(Tensor* t) {
+    int N = get_tensor_size(t);
+    for (int i = 0; i < N; ++i) {
+        t->values[i] = 1.0f / (1.0f + expf(-t->values[i]));
+    }
+}
+
+void sigmoid_derivative_inplace(Tensor* t) {
+    // t must already hold sigmoid(x)
+    int N = get_tensor_size(t);
+    for (int i = 0; i < N; ++i) {
+        float s = t->values[i];
+        t->values[i] = s * (1.0f - s);
+    }
+}
+
 void relu(Tensor* t) {
     int total_elements = get_tensor_size(t);
     float* p = t->values;

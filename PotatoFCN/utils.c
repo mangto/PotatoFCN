@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 // Dataset loader: reads info.txt, images and mask binaries
 void load_preprocessed_data(
@@ -80,6 +81,69 @@ Tensor* mse_loss_backward(const Tensor* pred, const Tensor* target) {
     float scale = 2.0f / size;
     for (int i = 0; i < size; ++i) {
         grad->values[i] = scale * (pred->values[i] - target->values[i]);
+    }
+    return grad;
+}
+
+float bce_loss(const Tensor* pred, const Tensor* target) {
+    int N = get_tensor_size(pred);
+    float loss = 0;
+    for (int i = 0; i < N; ++i) {
+        float p = fminf(fmaxf(pred->values[i], 1e-7f), 1 - 1e-7f);
+        float y = target->values[i];
+        loss += -(y * logf(p) + (1 - y) * logf(1 - p));
+    }
+    return loss / N;
+}
+
+Tensor* bce_loss_backward(const Tensor* pred, const Tensor* target) {
+    int N = get_tensor_size(pred);
+    Tensor* grad = create_tensor(pred->shape, pred->dims);
+    for (int i = 0; i < N; ++i) {
+        float p = fminf(fmaxf(pred->values[i], 1e-7f), 1 - 1e-7f);
+        float y = target->values[i];
+        grad->values[i] = (p - y) / (p * (1 - p) * N);
+    }
+    return grad;
+}
+
+float focal_loss(const Tensor* pred, const Tensor* target, float gamma) {
+    int N = get_tensor_size(pred);
+    float loss = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        // clamp to avoid log(0)
+        float p = fminf(fmaxf(pred->values[i], 1e-7f), 1.0f - 1e-7f);
+        float y = target->values[i];
+        // p_t = p if y==1 else (1-p)
+        float p_t = y ? p : (1.0f - p);
+        // focal weight = (1 - p_t)^gamma
+        float w = powf(1.0f - p_t, gamma);
+        // cross-entropy term
+        float ce = y ? -logf(p) : -logf(1.0f - p);
+        loss += w * ce;
+    }
+    return loss / N;
+}
+
+// --- Focal Loss backward ---
+Tensor* focal_loss_backward(const Tensor* pred, const Tensor* target, float gamma) {
+    int N = get_tensor_size(pred);
+    Tensor* grad = create_tensor(pred->shape, pred->dims);
+    for (int i = 0; i < N; ++i) {
+        float p = fminf(fmaxf(pred->values[i], 1e-7f), 1.0f - 1e-7f);
+        float y = target->values[i];
+        float p_t = y ? p : (1.0f - p);
+        float w = powf(1.0f - p_t, gamma);
+        // d/dp of focal term:
+        // for y=1: loss = w * (-log p)
+        //    dw/dp = -¥ã(1-p)^(¥ã-1)
+        //    dloss/dp = dw*(-log p) + w*(-1/p)
+        // for y=0: similarly using 1-p and log(1-p)
+        float dwdp = -gamma * powf(1.0f - p_t, gamma - 1.0f) * (y ? 1.0f : -1.0f);
+        float dcedp = y ? (-1.0f / p) : (1.0f / (1.0f - p));
+        float dloss_dp = dwdp * (y ? -logf(p) : -logf(1.0f - p)) + w * dcedp;
+        // average over N
+        grad->values[i] = dloss_dp / N;
     }
     return grad;
 }

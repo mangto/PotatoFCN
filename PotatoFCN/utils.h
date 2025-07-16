@@ -17,4 +17,10 @@ void load_preprocessed_data(
 double mse_loss(const Tensor* pred, const Tensor* target);
 Tensor* mse_loss_backward(const Tensor* pred, const Tensor* target);
 
+float bce_loss(const Tensor* pred, const Tensor* target);
+Tensor* bce_loss_backward(const Tensor* pred, const Tensor* target);
+
+float focal_loss(const Tensor* pred, const Tensor* target, float gamma);
+Tensor* focal_loss_backward(const Tensor* pred, const Tensor* target, float gamma);
+
 #endif // UTILS_H

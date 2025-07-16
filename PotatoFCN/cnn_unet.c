@@ -186,54 +186,105 @@ void unet_free_intermediates(UNetIntermediates* im) {
     }
 }
 
-// --- 모델 구조 빌드 함수 ---
+void add_sigmoid(Block* b) {
+    block_add_layer(b, (Layer) {
+        .type = LAYER_SIGMOID,
+            .weights = NULL,
+            .biases = NULL,
+            .grad_weights = NULL,
+            .grad_biases = NULL,
+            .input = NULL,
+            .output = NULL
+    });
+}
+
+static void add_batchnorm(Block* b, int channels) {
+    Layer l = {
+        .type = LAYER_BATCHNORM,
+        .weights = NULL, .biases = NULL,
+        .grad_weights = NULL, .grad_biases = NULL,
+        .input = NULL, .output = NULL
+    };
+
+    l.gamma = create_tensor((int[]) { channels }, 1);
+    l.beta = create_tensor((int[]) { channels }, 1);
+    l.grad_gamma = create_tensor((int[]) { channels }, 1);
+    l.grad_beta = create_tensor((int[]) { channels }, 1);
+    l.running_mean = create_tensor((int[]) { channels }, 1);
+    l.running_var = create_tensor((int[]) { channels }, 1);
+    l.batch_mean = create_tensor((int[]) { channels }, 1);
+    l.batch_var = create_tensor((int[]) { channels }, 1);
+    // gamma=1, beta=0
+    for (int i = 0; i < channels; ++i) {
+        l.gamma->values[i] = 1.0f;
+        l.beta->values[i] = 0.0f;
+    }
+    // running_* 은 0 초기화 (create_tensor에서 이미 0)
+    block_add_layer(b, l);
+}
+
+
+
+
 void unet_build(UNetModel* model) {
     int in_channels = 1;
 
     // Encoder Block 1
     block_init(&model->enc1);
     add_conv(&model->enc1, in_channels, 16, 3, 1, 1);
+    add_batchnorm(&model->enc1, 16);
     add_relu(&model->enc1);
     add_conv(&model->enc1, 16, 16, 3, 1, 1);
+    add_batchnorm(&model->enc1, 16);
     add_relu(&model->enc1);
 
     // Encoder Block 2
     block_init(&model->enc2);
     add_conv(&model->enc2, 16, 32, 3, 1, 1);
+    add_batchnorm(&model->enc2, 32);
     add_relu(&model->enc2);
     add_conv(&model->enc2, 32, 32, 3, 1, 1);
+    add_batchnorm(&model->enc2, 32);
     add_relu(&model->enc2);
 
     // Bottleneck
     block_init(&model->bottleneck);
     add_conv(&model->bottleneck, 32, 64, 3, 1, 1);
+    add_batchnorm(&model->bottleneck, 64);
     add_relu(&model->bottleneck);
 
     // Decoder Block 1 (Upsampling + Convolution)
     block_init(&model->dec_up1);
     add_transposed_conv(&model->dec_up1, 64, 32, 2, 2);
+    add_batchnorm(&model->dec_up1, 32);
     add_relu(&model->dec_up1);
 
     block_init(&model->dec_conv1);
     add_conv(&model->dec_conv1, 64, 32, 3, 1, 1); // Concat: 32(up) + 32(skip)
+    add_batchnorm(&model->dec_conv1, 32);
     add_relu(&model->dec_conv1);
     add_conv(&model->dec_conv1, 32, 32, 3, 1, 1);
+    add_batchnorm(&model->dec_conv1, 32);
     add_relu(&model->dec_conv1);
 
     // Decoder Block 2 (Upsampling + Convolution)
     block_init(&model->dec_up2);
     add_transposed_conv(&model->dec_up2, 32, 16, 2, 2);
+    add_batchnorm(&model->dec_up2, 16);
     add_relu(&model->dec_up2);
 
     block_init(&model->dec_conv2);
     add_conv(&model->dec_conv2, 32, 16, 3, 1, 1); // Concat: 16(up) + 16(skip)
+    add_batchnorm(&model->dec_conv2, 16);
     add_relu(&model->dec_conv2);
     add_conv(&model->dec_conv2, 16, 16, 3, 1, 1);
+    add_batchnorm(&model->dec_conv2, 16);
     add_relu(&model->dec_conv2);
 
     // Final Layer
     block_init(&model->final_conv);
     add_conv(&model->final_conv, 16, 1, 1, 1, 0); // 1x1 Convolution
+    add_sigmoid(&model->final_conv);
 
     // Allocate backward primitives and Adam moments, zero-init
     Block* blocks[] = {
@@ -268,6 +319,7 @@ void unet_build(UNetModel* model) {
 
 
 
+
 static Tensor* forward_block(Block* b, Tensor* input, Tensor** col_workspace_ptr) {
     Tensor* current = copy_tensor(input);
     for (int i = 0; i < b->num_layers; ++i) {
@@ -289,6 +341,49 @@ static Tensor* forward_block(Block* b, Tensor* input, Tensor** col_workspace_ptr
             next = copy_tensor(current);
             relu(next);
             break;
+        case LAYER_SIGMOID:
+            next = copy_tensor(current);
+            sigmoid_inplace(next);
+            break;
+        case LAYER_BATCHNORM: {
+            // 저장된 input
+            l->input = copy_tensor(current);
+            // 채널별 평균/분산 계산 (training 모드)
+            int N = current->shape[0], C = current->shape[1], H = current->shape[2], W = current->shape[3];
+            int HW = H * W;
+            Tensor* out = create_tensor(current->shape, current->dims);
+            for (int c = 0; c < C; ++c) {
+                // 1) mean
+                float sum = 0;
+                for (int n = 0; n < N; ++n)
+                    for (int i = 0; i < HW; ++i)
+                        sum += current->values[((n * C + c) * H * W) + i];
+                float mean = sum / (N * HW);
+                // 2) var
+                float var = 0;
+                for (int n = 0; n < N; ++n)
+                    for (int i = 0; i < HW; ++i) {
+                        float v = current->values[((n * C + c) * H * W) + i] - mean;
+                        var += v * v;
+                    }
+                var /= (N * HW);
+                // running 업데이트 (momentum=0.1)
+                l->running_mean->values[c] = 0.9f * l->running_mean->values[c] + 0.1f * mean;
+                l->running_var->values[c] = 0.9f * l->running_var->values[c] + 0.1f * var;
+                l->batch_mean->values[c] = mean;
+                l->batch_var->values[c] = var;
+                // 3) normalize + scale+shift
+                float inv_std = 1.0f / sqrtf(var + 1e-5f);
+                for (int n = 0; n < N; ++n)
+                    for (int i = 0; i < HW; ++i) {
+                        int idx = (n * C + c) * H * W + i;
+                        float normalized = (current->values[idx] - mean) * inv_std;
+                        out->values[idx] = l->gamma->values[c] * normalized + l->beta->values[c];
+                    }
+            }
+            next = out;
+            break;
+        }
         }
 
         if (l->output) free_tensor(l->output);
@@ -302,42 +397,19 @@ static Tensor* forward_block(Block* b, Tensor* input, Tensor** col_workspace_ptr
 
 static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr) {
     Tensor* current_grad = copy_tensor(grad);
-
     for (int i = b->num_layers - 1; i >= 0; --i) {
         Layer* l = &b->layers[i];
         Tensor* next_grad = NULL;
 
-        // ─── 1) LAZY‑INIT PRIMITIVES FOR THIS LAYER ───
-        if (!b->prim_inited[i] &&
-            (l->type == LAYER_CONV2D || l->type == LAYER_TRANSPOSED_CONV2D)) {
-            // l->input is now non‑NULL because forward has been called
-            int N = l->input->shape[0];
-            int C = l->input->shape[1];
-            int H = l->input->shape[2];
-            int W = l->input->shape[3];
-            int F = l->weights->shape[0];
-            int K = l->weights->shape[2];
-            int s = l->stride;
-            int p = (l->type == LAYER_CONV2D ? l->padding : 0);
-
-            if (l->type == LAYER_CONV2D) {
-                conv_bwd_weights_primitive_init(
-                    &b->conv_w_prims[i], N, C, H, W, F, K, s, p);
-                conv_bwd_data_primitive_init(
-                    &b->conv_d_prims[i], N, C, H, W, F, K, s, p);
-            }
-            else {
-                // transposed‐conv backward uses same init signature but no padding
-                conv_bwd_weights_primitive_init(
-                    &b->deconv_w_prims[i], N, C, H, W, F, K, s, p);
-                conv_bwd_data_primitive_init(
-                    &b->deconv_d_prims[i], N, C, H, W, F, K, s, p);
-            }
-            b->prim_inited[i] = true;
-        }
-
-        // ─── 2) ACTUAL BACKPROP ───
         switch (l->type) {
+        case LAYER_SIGMOID: {
+            // dL/dx = dL/dy * σ'(x)
+            Tensor* deriv = copy_tensor(l->output);  // σ(x)
+            sigmoid_derivative_inplace(deriv);
+            next_grad = tensor_elemwise_mul(current_grad, deriv);
+            free_tensor(deriv);
+            break;
+        }
         case LAYER_RELU: {
             Tensor* deriv = copy_tensor(l->input);
             relu_derivative(deriv);
@@ -345,58 +417,94 @@ static Tensor* backward_block(Block* b, Tensor* grad, Tensor** col_workspace_ptr
             free_tensor(deriv);
             break;
         }
+        case LAYER_BATCHNORM: {
+            // Full BatchNorm backward using saved batch_mean/var
+            Tensor* dy = copy_tensor(current_grad);
+            Tensor* x = l->input;
+            int N = x->shape[0], C = x->shape[1], H = x->shape[2], W = x->shape[3];
+            int M = N * H * W;
+
+            next_grad = create_tensor(x->shape, x->dims);
+            for (int c = 0; c < C; ++c) {
+                float mean = l->batch_mean->values[c];
+                float var = l->batch_var->values[c] + 1e-5f;
+                float inv_std = 1.0f / sqrtf(var);
+
+                // Compute gradients dgamma, dbeta
+                float dgamma = 0.0f, dbeta = 0.0f;
+                for (int n = 0; n < N; ++n) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            int idx = ((n * C + c) * H + h) * W + w;
+                            float xv = x->values[idx];
+                            float x_norm = (xv - mean) * inv_std;
+                            float dyv = dy->values[idx];
+                            dgamma += dyv * x_norm;
+                            dbeta += dyv;
+                        }
+                    }
+                }
+                // accumulate to gamma/beta grads
+                l->grad_gamma->values[c] += dgamma;
+                l->grad_beta->values[c] += dbeta;
+
+                // Precompute sums for dx
+                float sum_dy = 0.0f, sum_dy_xnorm = 0.0f;
+                for (int n = 0; n < N; ++n) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            int idx = ((n * C + c) * H + h) * W + w;
+                            float xv = x->values[idx];
+                            float x_norm = (xv - mean) * inv_std;
+                            float dyv = dy->values[idx];
+                            sum_dy += dyv;
+                            sum_dy_xnorm += dyv * x_norm;
+                        }
+                    }
+                }
+                // Compute dx using full formula
+                for (int n = 0; n < N; ++n) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            int idx = ((n * C + c) * H + h) * W + w;
+                            float xv = x->values[idx];
+                            float x_norm = (xv - mean) * inv_std;
+                            float dyv = dy->values[idx];
+                            float gamma = l->gamma->values[c];
+                            float dx = (1.0f / M) * gamma * inv_std *
+                                (M * dyv - sum_dy - x_norm * sum_dy_xnorm);
+                            next_grad->values[idx] = dx;
+                        }
+                    }
+                }
+            }
+            free_tensor(dy);
+            break;
+        }
         case LAYER_CONV2D: {
-            // 2a) weight‑grad
-            Tensor* gw = conv_bwd_weights_primitive_execute(
-                &b->conv_w_prims[i],
-                l->input,
-                current_grad
-            );
-            for (int j = 0; j < get_tensor_size(gw); ++j)
-                l->grad_weights->values[j] += gw->values[j];
-            free_tensor(gw);
-
-            // 2b) bias‑grad
+            Tensor* gw = tensor_conv_grad_weights(l->input, current_grad, l->weights, l->stride, l->padding, col_workspace_ptr);
             Tensor* gb = tensor_conv_grad_bias(current_grad);
-            for (int j = 0; j < get_tensor_size(gb); ++j)
-                l->grad_biases->values[j] += gb->values[j];
-            free_tensor(gb);
-
-            // 2c) input‑grad
-            next_grad = conv_bwd_data_primitive_execute(
-                &b->conv_d_prims[i],
-                current_grad,
-                l->weights
-            );
+            for (int j = 0; j < get_tensor_size(gw); ++j) l->grad_weights->values[j] += gw->values[j];
+            for (int j = 0; j < get_tensor_size(gb); ++j) l->grad_biases->values[j] += gb->values[j];
+            free_tensor(gw); free_tensor(gb);
+            next_grad = tensor_conv_grad_input(current_grad, l->weights, l->stride, l->padding, *col_workspace_ptr);
             break;
         }
         case LAYER_TRANSPOSED_CONV2D: {
-            // FALLBACK to CPU code for deconv
-            Tensor* gw = tensor_conv_grad_weights(
-                l->input, current_grad, l->weights, l->stride, 0, col_workspace_ptr);
-            for (int j = 0; j < get_tensor_size(gw); ++j)
-                l->grad_weights->values[j] += gw->values[j];
-            free_tensor(gw);
-
+            Tensor* gw = tensor_conv_grad_weights(current_grad, l->input, l->weights, l->stride, l->padding, col_workspace_ptr);
             Tensor* gb = tensor_conv_grad_bias(current_grad);
-            for (int j = 0; j < get_tensor_size(gb); ++j)
-                l->grad_biases->values[j] += gb->values[j];
-            free_tensor(gb);
-
+            for (int j = 0; j < get_tensor_size(gw); ++j) l->grad_weights->values[j] += gw->values[j];
+            for (int j = 0; j < get_tensor_size(gb); ++j) l->grad_biases->values[j] += gb->values[j];
+            free_tensor(gw); free_tensor(gb);
             Tensor* zero_bias = create_tensor((int[]) { l->biases->shape[0] }, 1);
-            next_grad = tensor_conv2d(
-                current_grad, l->weights, zero_bias, l->stride, 0, col_workspace_ptr);
+            next_grad = tensor_conv2d(current_grad, l->weights, zero_bias, l->stride, l->padding, col_workspace_ptr);
             free_tensor(zero_bias);
             break;
         }
-        default:
-            assert(!"Unknown layer type in backward_block");
         }
-
         free_tensor(current_grad);
         current_grad = next_grad;
     }
-
     return current_grad;
 }
 
